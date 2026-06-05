@@ -11,6 +11,7 @@ import {
   defaultWriteSettings,
   type AppSettingsV1
 } from '../shared/app-settings'
+import { KunConfigSchema } from '../../kun/src/config/kun-config.js'
 
 vi.mock('electron', () => ({
   app: {
@@ -208,6 +209,7 @@ describe('syncGuiManagedKunConfig', () => {
     if (!tempRoot) throw new Error('temp root not initialized')
     const configPath = join(tempRoot, 'config.json')
     writeFileSync(configPath, JSON.stringify({
+      legacyTopLevelFlag: true,
       contextCompaction: {
         modelProfiles: {
           'custom-model': {
@@ -237,6 +239,7 @@ describe('syncGuiManagedKunConfig', () => {
         }
       },
       serve: {
+        legacyServeFlag: true,
         tokenEconomy: {
           customTokenEconomyFlag: 'keep',
           historyHygiene: {
@@ -312,18 +315,19 @@ describe('syncGuiManagedKunConfig', () => {
     })
 
     const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as any
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
+    expect(parsed.legacyTopLevelFlag).toBeUndefined()
+    expect(parsed.serve.legacyServeFlag).toBeUndefined()
     expect(parsed.serve.storage).toMatchObject({
       backend: 'hybrid',
       sqlitePath: '/tmp/kun-index.sqlite3'
     })
     expect(parsed.serve.tokenEconomy).toMatchObject({
-      customTokenEconomyFlag: 'keep',
       enabled: true,
       compressToolDescriptions: false,
       compressToolResults: true,
       conciseResponses: false,
       historyHygiene: {
-        customHistoryFlag: true,
         maxToolResultLines: 100,
         maxToolResultBytes: 16384,
         maxToolResultTokens: 4000,
@@ -332,6 +336,8 @@ describe('syncGuiManagedKunConfig', () => {
         maxArrayItems: 40
       }
     })
+    expect(parsed.serve.tokenEconomy.customTokenEconomyFlag).toBeUndefined()
+    expect(parsed.serve.tokenEconomy.historyHygiene.customHistoryFlag).toBeUndefined()
     expect(parsed.contextCompaction).toMatchObject({
       defaultSoftThreshold: 32000,
       defaultHardThreshold: 64000,
@@ -357,12 +363,12 @@ describe('syncGuiManagedKunConfig', () => {
       }
     })
     expect(parsed.runtime.toolStorm).toMatchObject({
-      customStormFlag: 'keep',
       enabled: false,
       windowSize: 12,
       threshold: 4
     })
-    expect(parsed.runtime.customRuntimeFlag).toBe(true)
+    expect(parsed.runtime.toolStorm.customStormFlag).toBeUndefined()
+    expect(parsed.runtime.customRuntimeFlag).toBeUndefined()
     expect(parsed.runtime.toolArgumentRepair).toMatchObject({ maxStringBytes: 262144 })
     expect(parsed.capabilities.attachments).toMatchObject({ enabled: true })
     expect(parsed.capabilities.mcp.servers.github.command).toBe('github-mcp')
@@ -375,6 +381,18 @@ describe('syncGuiManagedKunConfig', () => {
       topKMax: 9,
       minScore: 0.2
     })
+  })
+
+  it('replaces unparsable historical Kun config with a valid GUI-managed config', async () => {
+    if (!tempRoot) throw new Error('temp root not initialized')
+    const configPath = join(tempRoot, 'config.json')
+    writeFileSync(configPath, '{ legacy config', 'utf8')
+    const module = await import('./kun-process')
+
+    await module.syncGuiManagedKunConfig(tempRoot, defaultKunRuntimeSettings())
+
+    const parsed = JSON.parse(readFileSync(configPath, 'utf8')) as unknown
+    expect(KunConfigSchema.safeParse(parsed).success).toBe(true)
   })
 
   it('does not enable MCP when the capability is explicitly disabled', async () => {

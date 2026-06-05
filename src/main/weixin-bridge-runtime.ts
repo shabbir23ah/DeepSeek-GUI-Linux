@@ -1,51 +1,46 @@
 import { app } from 'electron'
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process'
+import { randomBytes, randomUUID } from 'node:crypto'
 import { createRequire } from 'node:module'
-import { existsSync } from 'node:fs'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { createServer } from 'node:net'
+import { readFileSync } from 'node:fs'
+import { mkdir, readFile, writeFile, unlink } from 'node:fs/promises'
+import {
+  createServer as createHttpServer,
+  type IncomingMessage,
+  type Server as HttpServer,
+  type ServerResponse
+} from 'node:http'
+import { createServer as createNetServer } from 'node:net'
 import { dirname, join } from 'node:path'
-import { pathToFileURL } from 'node:url'
 import { DEFAULT_WEIXIN_BRIDGE_RPC_URL } from '../shared/app-settings'
 import { logError, logInfo, logWarn } from './logger'
 
 const requireFromHere = createRequire(import.meta.url)
 const WEIXIN_BRIDGE_PORT = 18790
 const WEIXIN_BRIDGE_MAX_PORT_ATTEMPTS = 20
-const WEIXIN_BRIDGE_STARTUP_TIMEOUT_MS = 20_000
 const WEIXIN_BRIDGE_HEALTH_TIMEOUT_MS = 3_000
 const WEIXIN_BRIDGE_STATE_DIR_NAME = 'weixin-bridge'
 const WEIXIN_PLUGIN_ID = 'openclaw-weixin'
-const ADMIN_RPC_PLUGIN_ID = 'admin-http-rpc'
-const WEIXIN_BRIDGE_ADAPTER_PLUGIN_ID = 'deepseek-gui-weixin-bridge-adapter'
-const WEIXIN_BRIDGE_ADAPTER_DIR_NAME = 'deepseek-gui-weixin-bridge-adapter'
-const OPENCLAW_MIN_NODE_MAJOR = 22
-const OPENCLAW_MIN_NODE_MINOR = 19
-const OPENCLAW_MIN_NODE_PATCH = 0
+const WEIXIN_API_BASE_URL = 'https://ilinkai.weixin.qq.com'
+const WEIXIN_CDN_BASE_URL = 'https://novac2c.cdn.weixin.qq.com/c2c'
+const WEIXIN_DEFAULT_BOT_TYPE = '3'
+const LOGIN_TTL_MS = 5 * 60_000
+const QR_LONG_POLL_TIMEOUT_MS = 35_000
+const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000
+const DEFAULT_API_TIMEOUT_MS = 15_000
+const RETRY_DELAY_MS = 2_000
+const BACKOFF_DELAY_MS = 30_000
+const MessageType = {
+  BOT: 2
+} as const
+const MessageItemType = {
+  TEXT: 1,
+  VOICE: 3
+} as const
+const MessageState = {
+  FINISH: 2
+} as const
 
-type ResolvedOpenClawCli = {
-  command: string
-  args: string[]
-  source: string
-  nodeVersion?: string
-}
-
-type NodeVersion = {
-  major: number
-  minor: number
-  patch: number
-}
-
-type ResolvedNodeRuntime = {
-  command: string
-  source: string
-  version: string
-}
-
-type WeixinBridgeConfigOptions = {
-  port: number
-  adapterPluginPath: string | null
-}
+type JsonRecord = Record<string, unknown>
 
 type WeixinBridgeRuntimeContext = {
   webhookUrl: string
@@ -53,52 +48,70 @@ type WeixinBridgeRuntimeContext = {
   channelId: string
 }
 
-type ResolvedWeixinPluginModules = {
-  root: string
-  channelModulePath: string
-  compatModulePath: string
+type WeixinPackageInfo = {
+  version: string
+  appId: string
+}
+
+type WeixinLoginSession = {
+  sessionKey: string
+  qrcode: string
+  qrcodeUrl: string
+  startedAt: number
+  currentApiBaseUrl?: string
+}
+
+type WeixinAccountData = {
+  token?: string
+  baseUrl?: string
+  userId?: string
 }
 
 type WeixinAccount = {
   accountId: string
   baseUrl: string
+  cdnBaseUrl: string
   token?: string
   configured: boolean
+  userId?: string
 }
 
-type WeixinAccountsModule = {
-  resolveWeixinAccount: (cfg: Record<string, unknown>, accountId?: string | null) => WeixinAccount
+type WeixinMessageItem = {
+  type?: number
+  text_item?: { text?: unknown }
+  voice_item?: { text?: unknown }
 }
 
-type WeixinInboundModule = {
-  restoreContextTokens: (accountId: string) => void
-  getContextToken: (accountId: string, userId: string) => string | undefined
+type WeixinMessage = {
+  message_id?: string
+  message_type?: number
+  from_user_id?: string
+  create_time_ms?: number
+  context_token?: string
+  item_list?: WeixinMessageItem[]
 }
 
-type WeixinSendModule = {
-  sendMessageWeixin: (params: {
-    to: string
-    text: string
-    opts: { baseUrl: string; token?: string; contextToken?: string; timeoutMs?: number }
-  }) => Promise<{ messageId: string }>
+type WeixinMonitor = {
+  accountId: string
+  controller: AbortController
+  promise: Promise<void>
 }
 
 export type WeixinBridgeSendResult =
   | { ok: true; messageId: string }
   | { ok: false; message: string }
 
-let child: ChildProcess | null = null
+let server: HttpServer | null = null
 let startPromise: Promise<string> | null = null
-let recentBridgeOutput: string[] = []
 let runtimeContextProvider: (() => Promise<WeixinBridgeRuntimeContext>) | null = null
 let activeBridgePort = WEIXIN_BRIDGE_PORT
+let packageInfoCache: WeixinPackageInfo | null = null
+const activeLogins = new Map<string, WeixinLoginSession>()
+const contextTokenStore = new Map<string, string>()
+const monitors = new Map<string, WeixinMonitor>()
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
-}
-
-function isChildRunning(): boolean {
-  return child !== null && child.exitCode === null
 }
 
 function resolveRpcUrl(port = activeBridgePort): string {
@@ -131,536 +144,192 @@ function resolvePackagePath(packageName: string, subpath: string): string | null
   }
 }
 
-function resolvePackageRoot(packageName: string): string | null {
-  const packageJson = resolvePackagePath(packageName, 'package.json')
+function resolveWeixinPluginRoot(): string | null {
+  const packageJson = resolvePackagePath('@tencent-weixin/openclaw-weixin', 'package.json')
   return packageJson ? dirname(packageJson) : null
 }
 
-function parseNodeVersion(raw: string): NodeVersion | null {
-  const match = raw.trim().replace(/^v/, '').match(/^(\d+)\.(\d+)\.(\d+)/)
-  if (!match) return null
+function readWeixinPackageInfo(): WeixinPackageInfo {
+  if (packageInfoCache) return packageInfoCache
+  const packageJson = resolvePackagePath('@tencent-weixin/openclaw-weixin', 'package.json')
+  if (!packageJson) {
+    throw new Error(
+      'Built-in WeChat login component is missing. Reinstall DeepSeek GUI or rebuild with @tencent-weixin/openclaw-weixin bundled.'
+    )
+  }
+  const parsed = JSON.parse(readFileSync(packageJson, 'utf8')) as JsonRecord
+  packageInfoCache = {
+    version: typeof parsed.version === 'string' ? parsed.version : '0.0.0',
+    appId: typeof parsed.ilink_appid === 'string' ? parsed.ilink_appid : 'bot'
+  }
+  return packageInfoCache
+}
+
+function buildClientVersion(version: string): number {
+  const [major = 0, minor = 0, patch = 0] = version
+    .split('.')
+    .map((part) => Number.parseInt(part, 10))
+    .map((part) => Number.isFinite(part) ? part : 0)
+  return ((major & 0xff) << 16) | ((minor & 0xff) << 8) | (patch & 0xff)
+}
+
+function buildBaseInfo(): JsonRecord {
+  const info = readWeixinPackageInfo()
   return {
-    major: Number(match[1]),
-    minor: Number(match[2]),
-    patch: Number(match[3])
+    channel_version: info.version,
+    bot_agent: `DeepSeekGUI/${app.getVersion() || '0.0.0'}`
   }
 }
 
-function isSupportedNodeVersion(version: NodeVersion | null): boolean {
-  if (!version) return false
-  if (version.major !== OPENCLAW_MIN_NODE_MAJOR) return version.major > OPENCLAW_MIN_NODE_MAJOR
-  if (version.minor !== OPENCLAW_MIN_NODE_MINOR) return version.minor > OPENCLAW_MIN_NODE_MINOR
-  return version.patch >= OPENCLAW_MIN_NODE_PATCH
+function randomWechatUin(): string {
+  const uint32 = randomBytes(4).readUInt32BE(0)
+  return Buffer.from(String(uint32), 'utf8').toString('base64')
 }
 
-function commandBasename(command: string): string {
-  const parts = command.split(/[\\/]/)
-  return parts.at(-1) ?? command
-}
-
-function toAsarUnpackedPath(filePath: string): string {
-  return filePath.replace(/\.asar([\\/])/, '.asar.unpacked$1')
-}
-
-function executableIfExists(filePath: string): string | null {
-  const unpackedPath = toAsarUnpackedPath(filePath)
-  if (existsSync(unpackedPath)) return unpackedPath
-  return existsSync(filePath) ? filePath : null
-}
-
-function splitPathEntries(value: string | undefined): string[] {
-  return (value ?? '')
-    .split(process.platform === 'win32' ? ';' : ':')
-    .map((entry) => entry.trim())
-    .filter(Boolean)
-}
-
-function listNodeRuntimeCandidates(): Array<{ command: string; source: string }> {
-  const executableName = process.platform === 'win32' ? 'node.exe' : 'node'
-  const candidates: Array<{ command: string; source: string }> = []
-  const push = (command: string | null | undefined, source: string) => {
-    if (!command) return
-    const resolved = executableIfExists(command)
-    if (!resolved) return
-    if (candidates.some((candidate) => candidate.command === resolved)) return
-    candidates.push({ command: resolved, source })
+function buildCommonHeaders(): Record<string, string> {
+  const info = readWeixinPackageInfo()
+  return {
+    'iLink-App-Id': info.appId,
+    'iLink-App-ClientVersion': String(buildClientVersion(info.version))
   }
-
-  push(process.env.DEEPSEEK_GUI_NODE_BINARY, 'env:DEEPSEEK_GUI_NODE_BINARY')
-  push(process.env.OPENCLAW_NODE_BINARY, 'env:OPENCLAW_NODE_BINARY')
-
-  const bundledNodeRoot = resolvePackageRoot('node')
-  if (bundledNodeRoot) {
-    push(join(bundledNodeRoot, 'bin', executableName), 'bundled-node')
-  }
-  for (const packageName of [
-    'node-bin-darwin-arm64',
-    'node-bin-linux-x64',
-    'node-bin-win-x64'
-  ]) {
-    const packageRoot = resolvePackageRoot(packageName)
-    if (packageRoot) {
-      push(join(packageRoot, 'bin', executableName), packageName)
-    }
-  }
-
-  if (!app.isPackaged) {
-    for (const entry of splitPathEntries(process.env.PATH)) {
-      push(join(entry, executableName), 'PATH')
-    }
-    push('/opt/homebrew/bin/node', 'dev-common')
-    push('/opt/homebrew/opt/node/bin/node', 'dev-common')
-    push('/usr/local/bin/node', 'dev-common')
-    push('/Applications/Codex.app/Contents/Resources/node', 'dev-common')
-  }
-
-  if (commandBasename(process.execPath).toLowerCase().startsWith('node')) {
-    push(process.execPath, 'process.execPath')
-  }
-
-  return candidates
 }
 
-function readNodeRuntimeVersion(command: string): string | null {
+function buildHeaders(token?: string): Record<string, string> {
+  return {
+    'Content-Type': 'application/json',
+    AuthorizationType: 'ilink_bot_token',
+    'X-WECHAT-UIN': randomWechatUin(),
+    ...buildCommonHeaders(),
+    ...(token?.trim() ? { Authorization: `Bearer ${token.trim()}` } : {})
+  }
+}
+
+async function readJsonResponse(res: Response): Promise<JsonRecord> {
+  const text = await res.text()
   try {
-    const result = spawnSync(command, ['-p', 'process.versions.node'], {
-      encoding: 'utf8',
-      timeout: 3_000,
-      stdio: ['ignore', 'pipe', 'pipe']
-    })
-    if (result.status !== 0) return null
-    const version = result.stdout.trim()
-    return isSupportedNodeVersion(parseNodeVersion(version)) ? version : null
+    return text ? JSON.parse(text) as JsonRecord : {}
   } catch {
-    return null
+    return { message: text.trim() || res.statusText }
   }
 }
 
-function resolveNodeRuntime(): ResolvedNodeRuntime | null {
-  for (const candidate of listNodeRuntimeCandidates()) {
-    const version = readNodeRuntimeVersion(candidate.command)
-    if (!version) continue
-    return {
-      command: candidate.command,
-      source: candidate.source,
-      version
-    }
+async function apiGet(
+  baseUrl: string,
+  endpoint: string,
+  timeoutMs: number,
+  label: string
+): Promise<JsonRecord> {
+  const url = new URL(endpoint, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`)
+  const res = await fetch(url.toString(), {
+    method: 'GET',
+    headers: buildCommonHeaders(),
+    signal: AbortSignal.timeout(timeoutMs)
+  })
+  const data = await readJsonResponse(res)
+  if (!res.ok) {
+    throw new Error(`${label} ${res.status}: ${recordString(data, 'message') || JSON.stringify(data)}`)
   }
-  return null
+  return data
 }
 
-function resolveOpenClawCli(): ResolvedOpenClawCli | null {
-  const nodeRuntime = resolveNodeRuntime()
-  if (!nodeRuntime) return null
-
-  const bundledCli = resolvePackagePath('openclaw', 'openclaw.mjs')
-  if (bundledCli) {
-    return {
-      command: nodeRuntime.command,
-      args: [bundledCli],
-      source: `bundled via ${nodeRuntime.source}`,
-      nodeVersion: nodeRuntime.version
-    }
+async function apiPost(
+  baseUrl: string,
+  endpoint: string,
+  body: JsonRecord,
+  options: { token?: string; timeoutMs?: number; label: string }
+): Promise<JsonRecord> {
+  const url = new URL(endpoint, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`)
+  const res = await fetch(url.toString(), {
+    method: 'POST',
+    headers: buildHeaders(options.token),
+    body: JSON.stringify(body),
+    signal: options.timeoutMs ? AbortSignal.timeout(options.timeoutMs) : undefined
+  })
+  const data = await readJsonResponse(res)
+  if (!res.ok) {
+    throw new Error(`${options.label} ${res.status}: ${recordString(data, 'message') || JSON.stringify(data)}`)
   }
-
-  const devGlobalCli = '/Users/zxy/.local/lib/node_modules/openclaw/openclaw.mjs'
-  if (!app.isPackaged && existsSync(devGlobalCli)) {
-    return {
-      command: nodeRuntime.command,
-      args: [devGlobalCli],
-      source: `dev-global via ${nodeRuntime.source}`,
-      nodeVersion: nodeRuntime.version
-    }
-  }
-
-  const devGlobalBin = '/opt/homebrew/bin/openclaw'
-  if (!app.isPackaged && existsSync(devGlobalBin)) {
-    return {
-      command: devGlobalBin,
-      args: [],
-      source: 'dev-global-bin'
-    }
-  }
-
-  return null
+  return data
 }
 
-function resolveWeixinPluginRoot(): string | null {
-  const bundled = resolvePackageRoot('@tencent-weixin/openclaw-weixin')
-  if (bundled) return bundled
-
-  const devGlobal = '/Users/zxy/.local/lib/node_modules/@tencent-weixin/openclaw-weixin'
-  return !app.isPackaged && existsSync(devGlobal) ? devGlobal : null
+function asRecord(value: unknown): JsonRecord {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? value as JsonRecord
+    : {}
 }
 
-function resolveWeixinPluginModules(): ResolvedWeixinPluginModules | null {
-  const root = resolveWeixinPluginRoot()
-  if (!root) return null
-  const channelModulePath = join(root, 'dist', 'src', 'channel.js')
-  const compatModulePath = join(root, 'dist', 'src', 'compat.js')
-  if (!existsSync(channelModulePath) || !existsSync(compatModulePath)) return null
-  return { root, channelModulePath, compatModulePath }
+function recordString(record: JsonRecord, key: string): string {
+  const value = record[key]
+  return typeof value === 'string' ? value.trim() : ''
 }
 
 function stateRoot(): string {
   return join(app.getPath('userData'), WEIXIN_BRIDGE_STATE_DIR_NAME)
 }
 
+function weixinStateDir(): string {
+  return join(stateRoot(), WEIXIN_PLUGIN_ID)
+}
+
+function accountsIndexPath(): string {
+  return join(weixinStateDir(), 'accounts.json')
+}
+
+function accountsDir(): string {
+  return join(weixinStateDir(), 'accounts')
+}
+
+function accountPath(accountId: string): string {
+  return join(accountsDir(), `${accountId}.json`)
+}
+
+function syncBufPath(accountId: string): string {
+  return join(accountsDir(), `${accountId}.sync.json`)
+}
+
+function contextTokensPath(accountId: string): string {
+  return join(accountsDir(), `${accountId}.context-tokens.json`)
+}
+
 function configPath(): string {
+  return join(stateRoot(), 'weixin-bridge.json')
+}
+
+function legacyOpenClawConfigPath(): string {
   return join(stateRoot(), 'openclaw.json')
 }
 
-function adapterRoot(): string {
-  return join(stateRoot(), WEIXIN_BRIDGE_ADAPTER_DIR_NAME)
+function isBlockedObjectKey(value: string): boolean {
+  return value === '__proto__' || value === 'prototype' || value === 'constructor'
 }
 
-function weixinAccountsPath(): string {
-  return join(stateRoot(), WEIXIN_PLUGIN_ID, 'accounts.json')
+function normalizeAccountId(value: string): string {
+  const trimmed = value.trim()
+  if (!trimmed) return 'default'
+  const lowered = trimmed.toLowerCase()
+  const normalized = /^[a-z0-9][a-z0-9_-]{0,63}$/i.test(trimmed)
+    ? lowered
+    : lowered
+        .replace(/[^a-z0-9_-]+/g, '-')
+        .replace(/^-+/, '')
+        .replace(/-+$/, '')
+        .slice(0, 64)
+  return normalized && !isBlockedObjectKey(normalized) ? normalized : 'default'
 }
 
-async function withWeixinBridgeStateEnv<T>(operation: () => Promise<T>): Promise<T> {
-  const previous = process.env.OPENCLAW_STATE_DIR
-  process.env.OPENCLAW_STATE_DIR = stateRoot()
-  try {
-    return await operation()
-  } finally {
-    if (previous === undefined) {
-      delete process.env.OPENCLAW_STATE_DIR
-    } else {
-      process.env.OPENCLAW_STATE_DIR = previous
-    }
-  }
+function deriveRawAccountId(normalizedId: string): string | undefined {
+  if (normalizedId.endsWith('-im-bot')) return `${normalizedId.slice(0, -7)}@im.bot`
+  if (normalizedId.endsWith('-im-wechat')) return `${normalizedId.slice(0, -10)}@im.wechat`
+  return undefined
 }
 
-async function readBridgeConfig(): Promise<Record<string, unknown>> {
-  const raw = await readFile(configPath(), 'utf8')
-  const parsed = JSON.parse(raw) as unknown
-  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
-    ? parsed as Record<string, unknown>
-    : {}
+async function ensureStateDirs(): Promise<void> {
+  await mkdir(accountsDir(), { recursive: true })
 }
 
-function buildWeixinBridgeAdapterPackageJson(): Record<string, unknown> {
-  return {
-    name: WEIXIN_BRIDGE_ADAPTER_PLUGIN_ID,
-    version: '1.0.0',
-    type: 'module',
-    openclaw: {
-      extensions: ['./index.mjs'],
-      runtimeExtensions: ['./index.mjs']
-    }
-  }
-}
-
-function buildWeixinBridgeAdapterManifest(): Record<string, unknown> {
-  return {
-    id: WEIXIN_BRIDGE_ADAPTER_PLUGIN_ID,
-    version: '1.0.0',
-    channels: [WEIXIN_PLUGIN_ID],
-    channelConfigs: {
-      [WEIXIN_PLUGIN_ID]: {
-        schema: {
-          type: 'object',
-          additionalProperties: true
-        },
-        label: 'WeChat',
-        description: 'DeepSeek GUI managed WeChat channel configuration.'
-      }
-    },
-    configSchema: {
-      type: 'object',
-      additionalProperties: false,
-      properties: {}
-    }
-  }
-}
-
-function buildWeixinBridgeAdapterSource(modules: ResolvedWeixinPluginModules): string {
-  const channelModuleUrl = pathToFileURL(modules.channelModulePath).href
-  const compatModuleUrl = pathToFileURL(modules.compatModulePath).href
-  const apiModuleUrl = pathToFileURL(join(modules.root, 'dist', 'src', 'api', 'api.js')).href
-  const accountsModuleUrl = pathToFileURL(join(modules.root, 'dist', 'src', 'auth', 'accounts.js')).href
-  const inboundModuleUrl = pathToFileURL(join(modules.root, 'dist', 'src', 'messaging', 'inbound.js')).href
-  const sendModuleUrl = pathToFileURL(join(modules.root, 'dist', 'src', 'messaging', 'send.js')).href
-  const syncBufModuleUrl = pathToFileURL(join(modules.root, 'dist', 'src', 'storage', 'sync-buf.js')).href
-  const typesModuleUrl = pathToFileURL(join(modules.root, 'dist', 'src', 'api', 'types.js')).href
-  return `import { weixinPlugin } from ${JSON.stringify(channelModuleUrl)}
-import { assertHostCompatibility } from ${JSON.stringify(compatModuleUrl)}
-import { getUpdates, notifyStart, notifyStop } from ${JSON.stringify(apiModuleUrl)}
-import { DEFAULT_BASE_URL } from ${JSON.stringify(accountsModuleUrl)}
-import { restoreContextTokens, setContextToken, weixinMessageToMsgContext } from ${JSON.stringify(inboundModuleUrl)}
-import { sendMessageWeixin } from ${JSON.stringify(sendModuleUrl)}
-import { getSyncBufFilePath, loadGetUpdatesBuf, saveGetUpdatesBuf } from ${JSON.stringify(syncBufModuleUrl)}
-import { MessageItemType, MessageType } from ${JSON.stringify(typesModuleUrl)}
-
-const WEB_LOGIN_METHODS = ['web.login.start', 'web.login.wait']
-const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000
-const RETRY_DELAY_MS = 2_000
-const BACKOFF_DELAY_MS = 30_000
-
-function sleep(ms, signal) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms)
-    signal?.addEventListener('abort', () => {
-      clearTimeout(timer)
-      reject(new Error('aborted'))
-    }, { once: true })
-  })
-}
-
-function textFromItemList(itemList) {
-  if (!Array.isArray(itemList)) return ''
-  for (const item of itemList) {
-    if (item?.type === MessageItemType.TEXT && item.text_item?.text != null) {
-      return String(item.text_item.text).trim()
-    }
-    if (item?.type === MessageItemType.VOICE && item.voice_item?.text != null) {
-      return String(item.voice_item.text).trim()
-    }
-  }
-  return ''
-}
-
-function readWebhookSettings() {
-  return {
-    url: process.env.DEEPSEEK_GUI_CLAW_IM_WEBHOOK_URL || 'http://127.0.0.1:8787/claw/im',
-    secret: process.env.DEEPSEEK_GUI_CLAW_IM_WEBHOOK_SECRET || '',
-    channelId: process.env.DEEPSEEK_GUI_CLAW_IM_CHANNEL_ID || ''
-  }
-}
-
-function formatAdapterError(error) {
-  return error instanceof Error ? error.message : String(error)
-}
-
-function logAdapterError(accountId, error) {
-  const message = formatAdapterError(error)
-  console.error(\`[deepseek-gui-weixin-bridge-adapter] [\${accountId}] \${message}\`)
-  return message
-}
-
-async function postToDeepSeekGuiWebhook(message, accountId) {
-  const settings = readWebhookSettings()
-  const ctx = weixinMessageToMsgContext(message, accountId)
-  const text = String(ctx.Body || textFromItemList(message.item_list)).trim()
-  if (!text) {
-    return { reply: 'Only text messages are supported right now.' }
-  }
-  const body = {
-    provider: 'weixin',
-    platform: 'weixin',
-    channelId: settings.channelId || undefined,
-    text,
-    sender: message.from_user_id || 'WeChat',
-    from: message.from_user_id || '',
-    chatId: message.from_user_id || '',
-    messageId: message.message_id || ctx.MessageSid || '',
-    senderId: message.from_user_id || '',
-    senderName: message.from_user_id || 'WeChat',
-    threadId: '',
-    message: {
-      provider: 'weixin',
-      text,
-      sender: message.from_user_id || 'WeChat'
-    }
-  }
-  const headers = { 'content-type': 'application/json' }
-  if (settings.secret) {
-    headers.authorization = \`Bearer \${settings.secret}\`
-    headers['x-deepseek-gui-secret'] = settings.secret
-  }
-  const res = await fetch(settings.url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(650_000)
-  })
-  const raw = await res.text()
-  let json = null
-  try {
-    json = raw ? JSON.parse(raw) : null
-  } catch {
-    json = null
-  }
-  if (!res.ok || json?.ok === false) {
-    const message = json?.message || raw || \`DeepSeek GUI webhook HTTP \${res.status}\`
-    throw new Error(message)
-  }
-  return json || {}
-}
-
-async function monitorDeepSeekGuiWeixinProvider(opts) {
-  const account = opts.account || {}
-  const accountId = opts.accountId || account.accountId || 'default'
-  const {
-    abortSignal,
-    setStatus
-  } = opts
-  const baseUrl = account.baseUrl || DEFAULT_BASE_URL
-  const token = account.token || ''
-  if (!account.configured || !token.trim()) {
-    throw new Error('weixin not configured: missing token')
-  }
-  restoreContextTokens(accountId)
-  setStatus?.({
-    accountId,
-    running: true,
-    lastStartAt: Date.now(),
-    lastEventAt: Date.now()
-  })
-  try {
-    await notifyStart({ baseUrl, token })
-  } catch {
-    // notifyStart is best-effort; long polling below is the source of truth.
-  }
-
-  const syncFilePath = getSyncBufFilePath(accountId)
-  let getUpdatesBuf = loadGetUpdatesBuf(syncFilePath) || ''
-  let nextTimeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS
-  let consecutiveFailures = 0
-  while (!abortSignal?.aborted) {
-    try {
-      const resp = await getUpdates({
-        baseUrl,
-        token,
-        get_updates_buf: getUpdatesBuf,
-        timeoutMs: nextTimeoutMs
-      })
-      if (resp.longpolling_timeout_ms != null && resp.longpolling_timeout_ms > 0) {
-        nextTimeoutMs = resp.longpolling_timeout_ms
-      }
-      const isApiError = (resp.ret !== undefined && resp.ret !== 0) ||
-        (resp.errcode !== undefined && resp.errcode !== 0)
-      if (isApiError) {
-        consecutiveFailures += 1
-        await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS, abortSignal)
-        if (consecutiveFailures >= 3) consecutiveFailures = 0
-        continue
-      }
-      consecutiveFailures = 0
-      setStatus?.({ accountId, lastEventAt: Date.now() })
-      if (resp.get_updates_buf != null && resp.get_updates_buf !== '') {
-        getUpdatesBuf = resp.get_updates_buf
-        saveGetUpdatesBuf(syncFilePath, getUpdatesBuf)
-      }
-      for (const message of resp.msgs ?? []) {
-        if (message.message_type === MessageType.BOT) continue
-        const to = message.from_user_id || ''
-        if (!to) continue
-        const contextToken = message.context_token || undefined
-        if (contextToken) setContextToken(accountId, to, contextToken)
-        setStatus?.({
-          accountId,
-          lastEventAt: Date.now(),
-          lastInboundAt: Date.now()
-        })
-        const result = await postToDeepSeekGuiWebhook(message, accountId)
-        const reply = typeof result.reply === 'string'
-          ? result.reply.trim()
-          : typeof result.text === 'string'
-            ? result.text.trim()
-            : ''
-        if (!reply) continue
-        await sendMessageWeixin({
-          to,
-          text: reply,
-          opts: { baseUrl, token, contextToken }
-        })
-        setStatus?.({
-          accountId,
-          lastEventAt: Date.now(),
-          lastOutboundAt: Date.now()
-        })
-      }
-    } catch (error) {
-      if (abortSignal?.aborted) return
-      const message = logAdapterError(accountId, error)
-      setStatus?.({
-        accountId,
-        lastEventAt: Date.now(),
-        lastError: message
-      })
-      consecutiveFailures += 1
-      await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS, abortSignal)
-      if (consecutiveFailures >= 3) consecutiveFailures = 0
-    }
-  }
-}
-
-export default {
-  id: ${JSON.stringify(WEIXIN_BRIDGE_ADAPTER_PLUGIN_ID)},
-  name: 'DeepSeek GUI WeChat Login',
-  description: 'Expose the bundled WeChat channel to DeepSeek GUI QR login.',
-  configSchema: {
-    type: 'object',
-    additionalProperties: false,
-    properties: {}
-  },
-  register(api) {
-    assertHostCompatibility(api.runtime?.version)
-    api.registerChannel({
-      plugin: {
-        ...weixinPlugin,
-        gatewayMethods: Array.from(new Set([...(weixinPlugin.gatewayMethods ?? []), ...WEB_LOGIN_METHODS])),
-        gateway: {
-          ...weixinPlugin.gateway,
-          startAccount: async (ctx) => monitorDeepSeekGuiWeixinProvider(ctx),
-          stopAccount: async (ctx) => {
-            const account = ctx.account || {}
-            if (!account.configured || !account.token?.trim()) return
-            try {
-              await notifyStop({
-                baseUrl: account.baseUrl || DEFAULT_BASE_URL,
-                token: account.token
-              })
-            } catch {
-              // Best-effort shutdown.
-            }
-          }
-        }
-      }
-    })
-  }
-}
-`
-}
-
-function buildGuiManagedOpenClawConfig(options: WeixinBridgeConfigOptions): Record<string, unknown> {
-  return {
-    gateway: {
-      mode: 'local',
-      bind: 'loopback',
-      port: options.port,
-      auth: {
-        mode: 'none'
-      }
-    },
-    plugins: {
-      enabled: true,
-      allow: [ADMIN_RPC_PLUGIN_ID, WEIXIN_BRIDGE_ADAPTER_PLUGIN_ID],
-      bundledDiscovery: 'allowlist',
-      load: {
-        paths: options.adapterPluginPath ? [options.adapterPluginPath] : []
-      },
-      entries: {
-        [ADMIN_RPC_PLUGIN_ID]: { enabled: true },
-        [WEIXIN_BRIDGE_ADAPTER_PLUGIN_ID]: { enabled: true }
-      }
-    },
-    channels: {
-      [WEIXIN_PLUGIN_ID]: {
-        enabled: true,
-        accounts: {
-          default: {
-            enabled: true
-          }
-        }
-      }
-    },
-    session: {
-      dmScope: 'per-account-channel-peer'
-    }
-  }
+async function readJsonFile(filePath: string): Promise<unknown> {
+  const raw = await readFile(filePath, 'utf8')
+  return JSON.parse(raw) as unknown
 }
 
 async function writeJsonIfChanged(filePath: string, value: unknown): Promise<void> {
@@ -671,41 +340,664 @@ async function writeJsonIfChanged(filePath: string, value: unknown): Promise<voi
   } catch {
     /* create the file below */
   }
+  await mkdir(dirname(filePath), { recursive: true })
   await writeFile(filePath, next, 'utf8')
 }
 
-async function prepareBridgeAdapter(modules: ResolvedWeixinPluginModules): Promise<string> {
-  const root = adapterRoot()
-  await mkdir(root, { recursive: true })
-  await writeJsonIfChanged(join(root, 'package.json'), buildWeixinBridgeAdapterPackageJson())
-  await writeJsonIfChanged(join(root, 'openclaw.plugin.json'), buildWeixinBridgeAdapterManifest())
-
-  const sourcePath = join(root, 'index.mjs')
-  const source = buildWeixinBridgeAdapterSource(modules)
+async function listIndexedWeixinAccountIds(): Promise<string[]> {
   try {
-    const current = await readFile(sourcePath, 'utf8')
-    if (current === source) return root
+    const parsed = await readJsonFile(accountsIndexPath())
+    return Array.isArray(parsed)
+      ? parsed.filter((id): id is string => typeof id === 'string' && id.trim() !== '')
+      : []
   } catch {
-    /* create the file below */
+    return []
   }
-  await writeFile(sourcePath, source, 'utf8')
-  return root
+}
+
+async function registerWeixinAccountId(accountId: string): Promise<void> {
+  await ensureStateDirs()
+  const existing = await listIndexedWeixinAccountIds()
+  if (existing.includes(accountId)) return
+  await writeJsonIfChanged(accountsIndexPath(), [...existing, accountId])
+}
+
+async function unregisterWeixinAccountId(accountId: string): Promise<void> {
+  const existing = await listIndexedWeixinAccountIds()
+  const next = existing.filter((id) => id !== accountId)
+  if (next.length !== existing.length) await writeJsonIfChanged(accountsIndexPath(), next)
+}
+
+async function readAccountFile(filePath: string): Promise<WeixinAccountData | null> {
+  try {
+    const parsed = await readJsonFile(filePath)
+    return asRecord(parsed) as WeixinAccountData
+  } catch {
+    return null
+  }
+}
+
+async function loadLegacyToken(): Promise<string | undefined> {
+  try {
+    const parsed = await readJsonFile(join(stateRoot(), 'credentials', WEIXIN_PLUGIN_ID, 'credentials.json'))
+    const token = asRecord(parsed).token
+    return typeof token === 'string' && token.trim() ? token.trim() : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function loadWeixinAccountData(accountId: string): Promise<WeixinAccountData | null> {
+  const primary = await readAccountFile(accountPath(accountId))
+  if (primary) return primary
+  const rawId = deriveRawAccountId(accountId)
+  if (rawId) {
+    const compat = await readAccountFile(accountPath(rawId))
+    if (compat) return compat
+  }
+  const legacyToken = await loadLegacyToken()
+  return legacyToken ? { token: legacyToken } : null
+}
+
+async function saveWeixinAccount(accountId: string, update: WeixinAccountData): Promise<void> {
+  await ensureStateDirs()
+  const existing = await loadWeixinAccountData(accountId) ?? {}
+  const token = update.token?.trim() || existing.token?.trim()
+  const baseUrl = update.baseUrl?.trim() || existing.baseUrl?.trim()
+  const userId = update.userId !== undefined
+    ? update.userId.trim() || undefined
+    : existing.userId?.trim() || undefined
+  await writeJsonIfChanged(accountPath(accountId), {
+    ...(token ? { token, savedAt: new Date().toISOString() } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+    ...(userId ? { userId } : {})
+  })
+  await registerWeixinAccountId(accountId)
+}
+
+async function clearWeixinAccount(accountId: string): Promise<void> {
+  for (const filePath of [accountPath(accountId), syncBufPath(accountId), contextTokensPath(accountId)]) {
+    try {
+      await unlink(filePath)
+    } catch {
+      /* ignore */
+    }
+  }
+  await unregisterWeixinAccountId(accountId)
+}
+
+async function clearStaleAccountsForUserId(currentAccountId: string, userId: string): Promise<void> {
+  if (!userId.trim()) return
+  for (const id of await listIndexedWeixinAccountIds()) {
+    if (id === currentAccountId) continue
+    const data = await loadWeixinAccountData(id)
+    if (data?.userId?.trim() === userId) await clearWeixinAccount(id)
+  }
+}
+
+async function resolveWeixinAccount(accountId: string): Promise<WeixinAccount> {
+  const id = normalizeAccountId(accountId)
+  const data = await loadWeixinAccountData(id)
+  const token = data?.token?.trim()
+  return {
+    accountId: id,
+    baseUrl: data?.baseUrl?.trim() || WEIXIN_API_BASE_URL,
+    cdnBaseUrl: WEIXIN_CDN_BASE_URL,
+    token,
+    configured: Boolean(token),
+    userId: data?.userId?.trim() || undefined
+  }
+}
+
+async function readBridgeConfig(): Promise<JsonRecord> {
+  try {
+    const parsed = await readJsonFile(configPath())
+    return asRecord(parsed)
+  } catch {
+    try {
+      const parsed = await readJsonFile(legacyOpenClawConfigPath())
+      return asRecord(parsed)
+    } catch {
+      return {}
+    }
+  }
 }
 
 async function prepareBridgeState(port: number): Promise<void> {
-  const root = stateRoot()
-  await mkdir(root, { recursive: true })
-  const weixinPluginModules = resolveWeixinPluginModules()
-  if (!weixinPluginModules) {
+  if (!resolveWeixinPluginRoot()) {
     throw new Error(
       'Built-in WeChat login component is missing. Reinstall DeepSeek GUI or rebuild with @tencent-weixin/openclaw-weixin bundled.'
     )
   }
-  const adapterPluginPath = await prepareBridgeAdapter(weixinPluginModules)
-  await writeJsonIfChanged(configPath(), buildGuiManagedOpenClawConfig({
-    port,
-    adapterPluginPath
-  }))
+  await ensureStateDirs()
+  await writeJsonIfChanged(configPath(), {
+    gateway: {
+      mode: 'local',
+      bind: 'loopback',
+      port,
+      auth: { mode: 'none' }
+    },
+    channels: {
+      [WEIXIN_PLUGIN_ID]: {
+        enabled: true
+      }
+    }
+  })
+}
+
+function isLoginFresh(login: WeixinLoginSession): boolean {
+  return Date.now() - login.startedAt < LOGIN_TTL_MS
+}
+
+function purgeExpiredLogins(): void {
+  for (const [key, login] of activeLogins) {
+    if (!isLoginFresh(login)) activeLogins.delete(key)
+  }
+}
+
+async function localTokenList(): Promise<string[]> {
+  const ids = await listIndexedWeixinAccountIds()
+  const tokens: string[] = []
+  for (let index = ids.length - 1; index >= 0 && tokens.length < 10; index -= 1) {
+    const data = await loadWeixinAccountData(ids[index])
+    const token = data?.token?.trim()
+    if (token) tokens.push(token)
+  }
+  return tokens
+}
+
+async function fetchQRCode(botType = WEIXIN_DEFAULT_BOT_TYPE): Promise<JsonRecord> {
+  return apiPost(
+    WEIXIN_API_BASE_URL,
+    `ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(botType)}`,
+    { local_token_list: await localTokenList() },
+    { label: 'fetchQRCode' }
+  )
+}
+
+async function pollQRStatus(baseUrl: string, qrcode: string): Promise<JsonRecord> {
+  try {
+    return await apiGet(
+      baseUrl,
+      `ilink/bot/get_qrcode_status?qrcode=${encodeURIComponent(qrcode)}`,
+      QR_LONG_POLL_TIMEOUT_MS,
+      'pollQRStatus'
+    )
+  } catch (error) {
+    if (error instanceof Error && error.name === 'TimeoutError') return { status: 'wait' }
+    logWarn('weixin-bridge', 'QR status polling failed; retrying.', {
+      message: error instanceof Error ? error.message : String(error)
+    })
+    return { status: 'wait' }
+  }
+}
+
+async function startWeixinLogin(params: JsonRecord): Promise<JsonRecord> {
+  readWeixinPackageInfo()
+  purgeExpiredLogins()
+  const force = params.force === true
+  const sessionKey = recordString(params, 'accountId') || randomUUID()
+  const existing = activeLogins.get(sessionKey)
+  if (!force && existing && isLoginFresh(existing) && existing.qrcodeUrl) {
+    return {
+      qrcode: existing.qrcodeUrl,
+      qrUrl: existing.qrcodeUrl,
+      qrDataUrl: existing.qrcodeUrl,
+      sessionKey,
+      message: '二维码已显示，请用手机微信扫描。'
+    }
+  }
+
+  const qr = await fetchQRCode(recordString(params, 'botType') || WEIXIN_DEFAULT_BOT_TYPE)
+  const qrcode = recordString(qr, 'qrcode')
+  const qrcodeUrl = recordString(qr, 'qrcode_img_content') || recordString(qr, 'qrcodeUrl')
+  if (!qrcode || !qrcodeUrl) {
+    throw new Error(recordString(qr, 'message') || 'WeChat QR response is incomplete.')
+  }
+  activeLogins.set(sessionKey, {
+    sessionKey,
+    qrcode,
+    qrcodeUrl,
+    startedAt: Date.now(),
+    currentApiBaseUrl: WEIXIN_API_BASE_URL
+  })
+  return {
+    qrcode: qrcodeUrl,
+    qrUrl: qrcodeUrl,
+    qrDataUrl: qrcodeUrl,
+    sessionKey,
+    message: '用手机微信扫描二维码，以继续连接。'
+  }
+}
+
+async function waitForWeixinLogin(params: JsonRecord): Promise<JsonRecord> {
+  const sessionKey = recordString(params, 'accountId') || recordString(params, 'sessionKey')
+  const login = activeLogins.get(sessionKey)
+  if (!login) return { connected: false, message: '当前没有进行中的登录，请先发起登录。' }
+  if (!isLoginFresh(login)) {
+    activeLogins.delete(sessionKey)
+    return { connected: false, message: '二维码已过期，请重新生成。' }
+  }
+
+  const timeoutMs = Math.max(Number(params.timeoutMs) || 480_000, 1_000)
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    const status = await pollQRStatus(login.currentApiBaseUrl ?? WEIXIN_API_BASE_URL, login.qrcode)
+    switch (recordString(status, 'status')) {
+      case 'wait':
+      case 'scaned':
+        break
+      case 'need_verifycode':
+        return {
+          connected: false,
+          message: '微信要求输入手机端验证码。当前 GUI 登录流程暂不支持验证码，请重新生成二维码后再试。'
+        }
+      case 'expired':
+        activeLogins.delete(sessionKey)
+        return { connected: false, message: '二维码已过期，请重新生成。' }
+      case 'verify_code_blocked':
+        activeLogins.delete(sessionKey)
+        return { connected: false, message: '多次输入错误，连接流程已停止。请稍后再试。' }
+      case 'binded_redirect':
+        activeLogins.delete(sessionKey)
+        return {
+          connected: true,
+          alreadyConnected: true,
+          accountId: normalizeAccountId(sessionKey),
+          sessionKey,
+          message: '已连接过此 DeepSeek GUI，无需重复连接。'
+        }
+      case 'scaned_but_redirect': {
+        const redirectHost = recordString(status, 'redirect_host')
+        if (redirectHost) login.currentApiBaseUrl = `https://${redirectHost}`
+        break
+      }
+      case 'confirmed': {
+        const rawAccountId = recordString(status, 'ilink_bot_id')
+        const token = recordString(status, 'bot_token')
+        if (!rawAccountId || !token) {
+          activeLogins.delete(sessionKey)
+          return { connected: false, message: '登录失败：服务器未返回完整账号信息。' }
+        }
+        const accountId = normalizeAccountId(rawAccountId)
+        const baseUrl = recordString(status, 'baseurl') || WEIXIN_API_BASE_URL
+        const userId = recordString(status, 'ilink_user_id')
+        await saveWeixinAccount(accountId, { token, baseUrl, userId })
+        await clearStaleAccountsForUserId(accountId, userId)
+        activeLogins.delete(sessionKey)
+        return {
+          connected: true,
+          accountId,
+          sessionKey,
+          baseUrl,
+          userId,
+          message: '已将此 DeepSeek GUI 连接到微信。'
+        }
+      }
+    }
+    await sleep(1_000)
+  }
+  activeLogins.delete(sessionKey)
+  return { connected: false, message: '登录超时，请重试。' }
+}
+
+function contextTokenKey(accountId: string, userId: string): string {
+  return `${accountId}:${userId}`
+}
+
+async function persistContextTokens(accountId: string): Promise<void> {
+  const prefix = `${accountId}:`
+  const tokens: Record<string, string> = {}
+  for (const [key, value] of contextTokenStore) {
+    if (key.startsWith(prefix)) tokens[key.slice(prefix.length)] = value
+  }
+  await writeJsonIfChanged(contextTokensPath(accountId), tokens)
+}
+
+async function restoreContextTokens(accountId: string): Promise<void> {
+  try {
+    const parsed = await readJsonFile(contextTokensPath(accountId))
+    for (const [userId, token] of Object.entries(asRecord(parsed))) {
+      if (typeof token === 'string' && token) {
+        contextTokenStore.set(contextTokenKey(accountId, userId), token)
+      }
+    }
+  } catch {
+    /* no persisted tokens */
+  }
+}
+
+async function setContextToken(accountId: string, userId: string, token: string): Promise<void> {
+  contextTokenStore.set(contextTokenKey(accountId, userId), token)
+  await persistContextTokens(accountId)
+}
+
+function getContextToken(accountId: string, userId: string): string | undefined {
+  return contextTokenStore.get(contextTokenKey(accountId, userId))
+}
+
+async function loadSyncBuf(accountId: string): Promise<string> {
+  try {
+    const parsed = await readJsonFile(syncBufPath(accountId))
+    const value = asRecord(parsed).get_updates_buf
+    return typeof value === 'string' ? value : ''
+  } catch {
+    return ''
+  }
+}
+
+async function saveSyncBuf(accountId: string, getUpdatesBuf: string): Promise<void> {
+  await writeJsonIfChanged(syncBufPath(accountId), { get_updates_buf: getUpdatesBuf })
+}
+
+async function notifyStart(account: WeixinAccount): Promise<void> {
+  await apiPost(
+    account.baseUrl,
+    'ilink/bot/msg/notifystart',
+    { base_info: buildBaseInfo() },
+    { token: account.token, timeoutMs: 10_000, label: 'notifyStart' }
+  )
+}
+
+async function notifyStop(account: WeixinAccount): Promise<void> {
+  await apiPost(
+    account.baseUrl,
+    'ilink/bot/msg/notifystop',
+    { base_info: buildBaseInfo() },
+    { token: account.token, timeoutMs: 10_000, label: 'notifyStop' }
+  )
+}
+
+async function getUpdates(
+  account: WeixinAccount,
+  getUpdatesBuf: string,
+  timeoutMs: number
+): Promise<JsonRecord> {
+  try {
+    return await apiPost(
+      account.baseUrl,
+      'ilink/bot/getupdates',
+      {
+        get_updates_buf: getUpdatesBuf,
+        base_info: buildBaseInfo()
+      },
+      { token: account.token, timeoutMs, label: 'getUpdates' }
+    )
+  } catch (error) {
+    if (error instanceof Error && error.name === 'TimeoutError') {
+      return { ret: 0, msgs: [], get_updates_buf: getUpdatesBuf }
+    }
+    throw error
+  }
+}
+
+function generateMessageId(): string {
+  return `deepseek-gui-weixin-${randomUUID()}`
+}
+
+async function sendMessageWeixin(params: {
+  account: WeixinAccount
+  to: string
+  text: string
+  contextToken?: string
+  timeoutMs?: number
+}): Promise<{ messageId: string }> {
+  const messageId = generateMessageId()
+  await apiPost(
+    params.account.baseUrl,
+    'ilink/bot/sendmessage',
+    {
+      msg: {
+        from_user_id: '',
+        to_user_id: params.to,
+        client_id: messageId,
+        message_type: MessageType.BOT,
+        message_state: MessageState.FINISH,
+        item_list: [{ type: MessageItemType.TEXT, text_item: { text: params.text } }],
+        context_token: params.contextToken
+      },
+      base_info: buildBaseInfo()
+    },
+    {
+      token: params.account.token,
+      timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
+      label: 'sendMessage'
+    }
+  )
+  return { messageId }
+}
+
+function textFromItemList(itemList: unknown): string {
+  if (!Array.isArray(itemList)) return ''
+  for (const item of itemList) {
+    const record = asRecord(item)
+    if (record.type === MessageItemType.TEXT) {
+      const text = asRecord(record.text_item).text
+      if (text != null) return String(text).trim()
+    }
+    if (record.type === MessageItemType.VOICE) {
+      const text = asRecord(record.voice_item).text
+      if (text != null) return String(text).trim()
+    }
+  }
+  return ''
+}
+
+function buildWebhookMessage(message: WeixinMessage, accountId: string, text: string): JsonRecord {
+  const from = message.from_user_id || ''
+  return {
+    provider: 'weixin',
+    platform: 'weixin',
+    text,
+    sender: from || 'WeChat',
+    from,
+    chatId: from,
+    messageId: message.message_id || generateMessageId(),
+    senderId: from,
+    senderName: from || 'WeChat',
+    threadId: '',
+    message: {
+      provider: 'weixin',
+      text,
+      sender: from || 'WeChat',
+      accountId
+    }
+  }
+}
+
+async function postToDeepSeekGuiWebhook(message: WeixinMessage, accountId: string): Promise<JsonRecord> {
+  const settings = await resolveRuntimeContext()
+  const text = textFromItemList(message.item_list)
+  if (!text) return { reply: 'Only text messages are supported right now.' }
+  const body = {
+    ...buildWebhookMessage(message, accountId, text),
+    channelId: settings.channelId || undefined
+  }
+  const headers: Record<string, string> = { 'content-type': 'application/json' }
+  if (settings.webhookSecret) {
+    headers.authorization = `Bearer ${settings.webhookSecret}`
+    headers['x-deepseek-gui-secret'] = settings.webhookSecret
+  }
+  const res = await fetch(settings.webhookUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(650_000)
+  })
+  const data = await readJsonResponse(res)
+  if (!res.ok || data.ok === false) {
+    throw new Error(recordString(data, 'message') || `DeepSeek GUI webhook HTTP ${res.status}`)
+  }
+  return data
+}
+
+async function monitorWeixinAccount(accountId: string, signal: AbortSignal): Promise<void> {
+  const account = await resolveWeixinAccount(accountId)
+  if (!account.configured || !account.token?.trim()) {
+    throw new Error(`WeChat account is not configured: ${accountId}`)
+  }
+  await restoreContextTokens(account.accountId)
+  try {
+    await notifyStart(account)
+  } catch {
+    /* best-effort */
+  }
+
+  let getUpdatesBuf = await loadSyncBuf(account.accountId)
+  let nextTimeoutMs = DEFAULT_LONG_POLL_TIMEOUT_MS
+  let consecutiveFailures = 0
+  while (!signal.aborted) {
+    try {
+      const resp = await getUpdates(account, getUpdatesBuf, nextTimeoutMs)
+      if (typeof resp.longpolling_timeout_ms === 'number' && resp.longpolling_timeout_ms > 0) {
+        nextTimeoutMs = resp.longpolling_timeout_ms
+      }
+      const ret = Number(resp.ret ?? 0)
+      const errcode = Number(resp.errcode ?? 0)
+      if (ret !== 0 || errcode !== 0) {
+        consecutiveFailures += 1
+        await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS)
+        if (consecutiveFailures >= 3) consecutiveFailures = 0
+        continue
+      }
+      consecutiveFailures = 0
+      const nextBuf = typeof resp.get_updates_buf === 'string' ? resp.get_updates_buf : ''
+      if (nextBuf) {
+        getUpdatesBuf = nextBuf
+        await saveSyncBuf(account.accountId, getUpdatesBuf)
+      }
+      const messages = Array.isArray(resp.msgs) ? resp.msgs as WeixinMessage[] : []
+      for (const message of messages) {
+        if (signal.aborted) return
+        if (message.message_type === MessageType.BOT) continue
+        const to = message.from_user_id || ''
+        if (!to) continue
+        const contextToken = message.context_token || undefined
+        if (contextToken) await setContextToken(account.accountId, to, contextToken)
+        const result = await postToDeepSeekGuiWebhook(message, account.accountId)
+        const reply = recordString(result, 'reply') || recordString(result, 'text')
+        if (!reply) continue
+        await sendMessageWeixin({
+          account,
+          to,
+          text: reply,
+          contextToken
+        })
+      }
+    } catch (error) {
+      if (signal.aborted) return
+      logWarn('weixin-bridge', 'WeChat monitor iteration failed.', {
+        accountId: account.accountId,
+        message: error instanceof Error ? error.message : String(error)
+      })
+      consecutiveFailures += 1
+      await sleep(consecutiveFailures >= 3 ? BACKOFF_DELAY_MS : RETRY_DELAY_MS)
+      if (consecutiveFailures >= 3) consecutiveFailures = 0
+    }
+  }
+
+  try {
+    await notifyStop(account)
+  } catch {
+    /* best-effort */
+  }
+}
+
+function startAccountMonitor(accountId: string): void {
+  const normalized = normalizeAccountId(accountId)
+  const existing = monitors.get(normalized)
+  if (existing && !existing.controller.signal.aborted) return
+  const controller = new AbortController()
+  const promise = monitorWeixinAccount(normalized, controller.signal).catch((error) => {
+    if (!controller.signal.aborted) {
+      logError('weixin-bridge', 'WeChat monitor stopped.', {
+        accountId: normalized,
+        message: error instanceof Error ? error.message : String(error)
+      })
+    }
+  }).finally(() => {
+    if (monitors.get(normalized)?.controller === controller) monitors.delete(normalized)
+  })
+  monitors.set(normalized, { accountId: normalized, controller, promise })
+}
+
+async function startWeixinChannels(params: JsonRecord): Promise<JsonRecord> {
+  const requestedAccountId = recordString(params, 'accountId')
+  const accountIds = requestedAccountId
+    ? [normalizeAccountId(requestedAccountId)]
+    : await listIndexedWeixinAccountIds()
+  for (const accountId of accountIds) startAccountMonitor(accountId)
+  return { started: accountIds }
+}
+
+async function stopWeixinChannels(params: JsonRecord): Promise<JsonRecord> {
+  const requestedAccountId = recordString(params, 'accountId')
+  const targets = requestedAccountId ? [normalizeAccountId(requestedAccountId)] : [...monitors.keys()]
+  for (const accountId of targets) {
+    monitors.get(accountId)?.controller.abort()
+    monitors.delete(accountId)
+  }
+  return { stopped: targets }
+}
+
+async function dispatchRpc(method: string, params: JsonRecord): Promise<JsonRecord> {
+  switch (method) {
+    case 'web.login.start':
+      return startWeixinLogin(params)
+    case 'web.login.wait':
+      return waitForWeixinLogin(params)
+    case 'channels.start':
+      if (recordString(params, 'channel') && recordString(params, 'channel') !== WEIXIN_PLUGIN_ID) {
+        throw new Error(`Unsupported channel: ${recordString(params, 'channel')}`)
+      }
+      return startWeixinChannels(params)
+    case 'channels.stop':
+      return stopWeixinChannels(params)
+    case 'accounts.list':
+      return { accounts: await listIndexedWeixinAccountIds() }
+    default:
+      throw new Error(`Unknown WeChat bridge method: ${method}`)
+  }
+}
+
+async function readRequestBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = []
+  for await (const chunk of request) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+  return Buffer.concat(chunks).toString('utf8')
+}
+
+function writeJson(response: ServerResponse, status: number, body: unknown): void {
+  response.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  response.end(`${JSON.stringify(body)}\n`)
+}
+
+async function handleBridgeRequest(request: IncomingMessage, response: ServerResponse): Promise<void> {
+  try {
+    const url = new URL(request.url || '/', `http://127.0.0.1:${activeBridgePort}`)
+    if (request.method === 'GET' && url.pathname === '/health') {
+      writeJson(response, 200, { ok: true, status: 'live' })
+      return
+    }
+    if (request.method !== 'POST' || url.pathname !== '/api/v1/admin/rpc') {
+      writeJson(response, 404, { ok: false, message: 'Not found' })
+      return
+    }
+    const body = asRecord(JSON.parse(await readRequestBody(request)) as unknown)
+    const id = body.id ?? null
+    const method = recordString(body, 'method')
+    const params = asRecord(body.params)
+    if (!method) throw new Error('JSON-RPC method is required.')
+    const result = await dispatchRpc(method, params)
+    writeJson(response, 200, { jsonrpc: '2.0', id, ok: true, result })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    writeJson(response, 200, {
+      jsonrpc: '2.0',
+      id: null,
+      ok: false,
+      error: { message }
+    })
+  }
 }
 
 async function fetchBridgeHealth(port = activeBridgePort): Promise<boolean> {
@@ -721,75 +1013,19 @@ async function fetchBridgeHealth(port = activeBridgePort): Promise<boolean> {
   }
 }
 
-async function hasPersistedWeixinAccount(): Promise<boolean> {
-  try {
-    const raw = await readFile(weixinAccountsPath(), 'utf8')
-    const accounts = JSON.parse(raw) as unknown
-    return Array.isArray(accounts) && accounts.some((account) =>
-      typeof account === 'string' && account.trim()
-    )
-  } catch {
-    return false
-  }
-}
-
-async function requestBridgeRpc(
-  port: number,
-  method: string,
-  params: Record<string, unknown>,
-  timeoutMs = 10_000
-): Promise<Record<string, unknown>> {
-  const res = await fetch(resolveRpcUrl(port), {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: `${method}-${Date.now()}`,
-      method,
-      params
-    }),
-    signal: AbortSignal.timeout(timeoutMs)
-  })
-  const text = await res.text()
-  const data = text ? JSON.parse(text) as Record<string, unknown> : {}
-  if (!res.ok || data.ok === false) {
-    const error = typeof data.error === 'object' && data.error !== null
-      ? data.error as Record<string, unknown>
-      : {}
-    const message = typeof error.message === 'string'
-      ? error.message
-      : typeof data.message === 'string'
-        ? data.message
-        : `HTTP ${res.status}`
-    throw new Error(message)
-  }
-  return data
-}
-
-async function startPersistedWeixinChannel(port: number): Promise<void> {
-  if (!await hasPersistedWeixinAccount()) return
-  try {
-    await requestBridgeRpc(port, 'channels.start', { channel: WEIXIN_PLUGIN_ID }, 30_000)
-  } catch (error) {
-    logWarn('weixin-bridge', 'Failed to start persisted WeChat channel.', {
-      message: error instanceof Error ? error.message : String(error)
-    })
-  }
-}
-
 async function isPortAvailable(port: number): Promise<boolean> {
   return new Promise((resolve) => {
-    const server = createServer()
-    server.unref()
-    server.once('error', () => resolve(false))
-    server.listen({ host: '127.0.0.1', port }, () => {
-      server.close(() => resolve(true))
+    const probe = createNetServer()
+    probe.unref()
+    probe.once('error', () => resolve(false))
+    probe.listen({ host: '127.0.0.1', port }, () => {
+      probe.close(() => resolve(true))
     })
   })
 }
 
 async function resolveAvailableBridgePort(): Promise<number> {
-  if (isChildRunning() && await fetchBridgeHealth(activeBridgePort)) return activeBridgePort
+  if (server && await fetchBridgeHealth(activeBridgePort)) return activeBridgePort
   for (let offset = 0; offset < WEIXIN_BRIDGE_MAX_PORT_ATTEMPTS; offset += 1) {
     const port = WEIXIN_BRIDGE_PORT + offset
     if (await isPortAvailable(port)) return port
@@ -797,98 +1033,39 @@ async function resolveAvailableBridgePort(): Promise<number> {
   throw new Error('Built-in WeChat login component could not find an available local port.')
 }
 
-async function waitForBridgeHealth(startedChild: ChildProcess): Promise<void> {
-  const deadline = Date.now() + WEIXIN_BRIDGE_STARTUP_TIMEOUT_MS
-  while (Date.now() < deadline) {
-    if (await fetchBridgeHealth()) return
-    if (startedChild.exitCode !== null) {
-      const detail = recentBridgeOutput.length > 0 ? ` ${recentBridgeOutput.slice(-6).join(' ')}` : ''
-      throw new Error(`Built-in WeChat login component exited with code ${startedChild.exitCode}.${detail}`)
+async function listen(serverToStart: HttpServer, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    const onError = (error: Error): void => {
+      serverToStart.off('listening', onListening)
+      reject(error)
     }
-    await sleep(300)
-  }
-  throw new Error('Built-in WeChat login component did not become ready in time.')
+    const onListening = (): void => {
+      serverToStart.off('error', onError)
+      resolve()
+    }
+    serverToStart.once('error', onError)
+    serverToStart.once('listening', onListening)
+    serverToStart.listen({ host: '127.0.0.1', port })
+  })
 }
 
-function bridgeEnv(context: WeixinBridgeRuntimeContext): NodeJS.ProcessEnv {
-  const root = stateRoot()
-  return {
-    ...process.env,
-    OPENCLAW_STATE_DIR: root,
-    OPENCLAW_CONFIG_PATH: configPath(),
-    DEEPSEEK_GUI_CLAW_IM_WEBHOOK_URL: context.webhookUrl,
-    DEEPSEEK_GUI_CLAW_IM_WEBHOOK_SECRET: context.webhookSecret,
-    DEEPSEEK_GUI_CLAW_IM_CHANNEL_ID: context.channelId
-  }
-}
-
-function captureBridgeOutput(stream: 'stdout' | 'stderr', chunk: Buffer | string): void {
-  const text = String(chunk).trim()
-  if (!text) return
-  const lines = text.split(/\r?\n/).slice(-10)
-  recentBridgeOutput.push(...lines)
-  recentBridgeOutput = recentBridgeOutput.slice(-20)
-  for (const line of lines) {
-    logInfo('weixin-bridge', `[${stream}] ${line}`)
-  }
-}
-
-async function startBridgeProcess(): Promise<string> {
-  if (isChildRunning() && await fetchBridgeHealth(activeBridgePort)) return resolveRpcUrl()
-
+async function startBridgeServer(): Promise<string> {
+  if (server && await fetchBridgeHealth(activeBridgePort)) return resolveRpcUrl()
   const port = await resolveAvailableBridgePort()
   activeBridgePort = port
   await prepareBridgeState(port)
-  const runtimeContext = await resolveRuntimeContext()
-  const cli = resolveOpenClawCli()
-  if (!cli) {
-    throw new Error('Built-in WeChat login runtime is missing. Reinstall DeepSeek GUI.')
-  }
-
-  const args = [
-    ...cli.args,
-    'gateway',
-    'run',
-    '--allow-unconfigured',
-    '--bind',
-    'loopback',
-    '--auth',
-    'none',
-    '--port',
-    String(port)
-  ]
-  child = spawn(cli.command, args, {
-    env: bridgeEnv(runtimeContext),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    detached: false
+  server = createHttpServer((request, response) => {
+    void handleBridgeRequest(request, response)
   })
-  const startedChild = child
-  recentBridgeOutput = []
-  logInfo(
-    'weixin-bridge',
-    `spawned ${cli.source} bridge on port ${port}` +
-    (cli.nodeVersion ? ` (node ${cli.nodeVersion})` : '')
-  )
-  startedChild.stdout?.on('data', (chunk) => captureBridgeOutput('stdout', chunk))
-  startedChild.stderr?.on('data', (chunk) => captureBridgeOutput('stderr', chunk))
-  startedChild.on('error', (error) => {
-    logError('weixin-bridge', 'process error', error)
-  })
-  startedChild.on('exit', (code, signal) => {
-    logWarn('weixin-bridge', signal ? `exited with signal ${signal}` : `exited with code ${code ?? 'unknown'}`)
-    if (child === startedChild) {
-      child = null
-      startPromise = null
-    }
-  })
-  await waitForBridgeHealth(startedChild)
-  await startPersistedWeixinChannel(port)
+  await listen(server, port)
+  logInfo('weixin-bridge', `started built-in GUI WeChat bridge on port ${port}`)
+  await startWeixinChannels({})
   return resolveRpcUrl()
 }
 
 export async function ensureWeixinBridgeRpcUrl(): Promise<string> {
   if (!startPromise) {
-    startPromise = startBridgeProcess().catch((error) => {
+    startPromise = startBridgeServer().catch((error) => {
       startPromise = null
       throw error
     })
@@ -901,7 +1078,7 @@ export async function sendWeixinBridgeMessage(options: {
   to: string
   text: string
 }): Promise<WeixinBridgeSendResult> {
-  const accountId = options.accountId.trim()
+  const accountId = normalizeAccountId(options.accountId)
   const to = options.to.trim()
   const text = options.text.trim()
   if (!accountId) return { ok: false, message: 'WeChat account id is missing.' }
@@ -910,37 +1087,20 @@ export async function sendWeixinBridgeMessage(options: {
 
   try {
     await ensureWeixinBridgeRpcUrl()
-    return await withWeixinBridgeStateEnv(async () => {
-      const modules = resolveWeixinPluginModules()
-      if (!modules) {
-        return {
-          ok: false as const,
-          message: 'Built-in WeChat login component is missing. Reinstall DeepSeek GUI.'
-        }
-      }
-      const [accountsModule, inboundModule, sendModule] = await Promise.all([
-        import(pathToFileURL(join(modules.root, 'dist', 'src', 'auth', 'accounts.js')).href) as Promise<WeixinAccountsModule>,
-        import(pathToFileURL(join(modules.root, 'dist', 'src', 'messaging', 'inbound.js')).href) as Promise<WeixinInboundModule>,
-        import(pathToFileURL(join(modules.root, 'dist', 'src', 'messaging', 'send.js')).href) as Promise<WeixinSendModule>
-      ])
-      const cfg = await readBridgeConfig()
-      const account = accountsModule.resolveWeixinAccount(cfg, accountId)
-      if (!account.configured || !account.token?.trim()) {
-        return { ok: false as const, message: 'WeChat account is not configured.' }
-      }
-      inboundModule.restoreContextTokens(account.accountId)
-      const contextToken = inboundModule.getContextToken(account.accountId, to)
-      const result = await sendModule.sendMessageWeixin({
-        to,
-        text,
-        opts: {
-          baseUrl: account.baseUrl,
-          token: account.token,
-          contextToken
-        }
-      })
-      return { ok: true as const, messageId: result.messageId }
+    const cfg = await readBridgeConfig()
+    void cfg
+    const account = await resolveWeixinAccount(accountId)
+    if (!account.configured || !account.token?.trim()) {
+      return { ok: false as const, message: 'WeChat account is not configured.' }
+    }
+    await restoreContextTokens(account.accountId)
+    const result = await sendMessageWeixin({
+      account,
+      to,
+      text,
+      contextToken: getContextToken(account.accountId, to)
     })
+    return { ok: true as const, messageId: result.messageId }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
     logError('weixin-bridge', 'Failed to send WeChat message from GUI.', {
@@ -954,15 +1114,15 @@ export async function sendWeixinBridgeMessage(options: {
 
 export function stopWeixinBridgeRuntime(): void {
   startPromise = null
-  if (!child) return
-  const runningChild = child
-  child = null
-  runningChild.kill()
+  for (const monitor of monitors.values()) monitor.controller.abort()
+  monitors.clear()
+  if (!server) return
+  const runningServer = server
+  server = null
+  runningServer.close()
 }
 
 export const weixinBridgeRuntimeInternals = {
-  buildGuiManagedOpenClawConfig,
-  buildWeixinBridgeAdapterSource,
-  isSupportedNodeVersion,
-  parseNodeVersion
+  buildBaseInfo,
+  normalizeAccountId
 }

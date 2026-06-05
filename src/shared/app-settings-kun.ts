@@ -27,6 +27,7 @@ import {
 
 const LEGACY_COREAGENT_DATA_DIR = '~/.deepseekgui/coreagent'
 const LEGACY_KUN_DEFAULT_MODEL = 'deepseek-chat'
+const LEGACY_LOCAL_HTTP_DEFAULT_PORT = 7878
 
 type LegacyLocalHttpRuntimeSettingsV1 = {
   binaryPath: string
@@ -175,7 +176,8 @@ export function defaultKunRuntimeTuningSettings(): KunRuntimeTuningSettingsV1 {
 export function getKunRuntimeSettings(
   settings: AppSettingsV1
 ): KunRuntimeSettingsV1 {
-  return settings.agents.kun
+  const raw = (settings as { agents?: { kun?: Partial<KunRuntimeSettingsV1> } }).agents?.kun
+  return mergeKunRuntimeSettings(defaultKunRuntimeSettings(), raw)
 }
 
 export function kunSettingsEnvelope(
@@ -452,6 +454,10 @@ function upgradeLegacyKunDefaultModel(value: unknown, fallback: string): string 
   return model === LEGACY_KUN_DEFAULT_MODEL ? DEFAULT_KUN_MODEL : model
 }
 
+function upgradeLegacyKunDefaultPort(value: unknown, fallback: number): number {
+  return value === LEGACY_LOCAL_HTTP_DEFAULT_PORT ? DEFAULT_KUN_PORT : fallback
+}
+
 export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partial<AppSettingsV1> {
   const rawAgentProvider = parsed.agentProvider
   const isReasoningLegacy = rawAgentProvider === 'reasonix'
@@ -471,8 +477,10 @@ export function migrateLegacyAppSettings(parsed: LegacyAppSettingsShape): Partia
   const explicitKun: Partial<KunRuntimeSettingsV1> = parsed.agents?.kun ?? {}
   const legacySource = isReasoningLegacy ? legacyReasoning : legacyLocalHttp
   const legacySeed = {
-    binaryPath: isReasoningLegacy ? kunDefaults.binaryPath : legacyLocalHttp.binaryPath,
-    port: isReasoningLegacy ? kunDefaults.port : legacyLocalHttp.port,
+    binaryPath: kunDefaults.binaryPath,
+    port: isReasoningLegacy
+      ? kunDefaults.port
+      : upgradeLegacyKunDefaultPort(legacyLocalHttp.port, legacyLocalHttp.port),
     autoStart: isReasoningLegacy ? legacyReasoning.autoStart : legacyLocalHttp.autoStart,
     apiKey: legacySource.apiKey,
     baseUrl: legacySource.baseUrl,

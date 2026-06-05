@@ -322,6 +322,59 @@ describe('kun envelope helpers', () => {
 })
 
 describe('legacy Kun defaults migration', () => {
+  it('normalizes old master settings without an agents.kun envelope', () => {
+    const normalized = normalizeAppSettings({
+      version: 1,
+      locale: 'zh',
+      theme: 'dark',
+      uiFontScale: 'small',
+      agentProvider: 'deepseek-runtime',
+      deepseek: {
+        binaryPath: '/usr/local/bin/deepseek',
+        port: 8787,
+        autoStart: false,
+        apiKey: 'sk-old',
+        baseUrl: 'https://api.deepseek.com',
+        runtimeToken: 'old-token',
+        extraCorsOrigins: [],
+        approvalPolicy: 'on-request',
+        sandboxMode: 'read-only'
+      },
+      workspaceRoot: '/tmp/legacy-workspace',
+      log: { enabled: true, retentionDays: 2 },
+      notifications: { turnComplete: true },
+      guiUpdate: { channel: 'frontier' },
+      claw: defaultClawSettings()
+    } as unknown as AppSettingsV1)
+
+    expect(normalized.agents.kun).toEqual(expect.objectContaining({
+      binaryPath: '',
+      port: 8787,
+      autoStart: false,
+      runtimeToken: 'old-token',
+      approvalPolicy: 'on-request',
+      sandboxMode: 'read-only'
+    }))
+    expect(normalized.provider).toEqual(expect.objectContaining({
+      apiKey: 'sk-old',
+      baseUrl: 'https://api.deepseek.com'
+    }))
+    expect('agentProvider' in normalized).toBe(false)
+    expect('deepseek' in normalized).toBe(false)
+  })
+
+  it('moves the legacy local HTTP default port to the Kun default port', () => {
+    const migrated = migrateLegacyAppSettings({
+      version: 1,
+      agentProvider: 'deepseek-runtime',
+      deepseek: {
+        port: 7878
+      }
+    } as unknown as Parameters<typeof migrateLegacyAppSettings>[0])
+
+    expect(migrated.agents?.kun?.port).toBe(8899)
+  })
+
   it('upgrades old persisted Kun defaults to the current defaults', () => {
     const migrated = migrateLegacyAppSettings({
       version: 1,

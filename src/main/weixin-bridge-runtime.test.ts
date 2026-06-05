@@ -1,90 +1,42 @@
 import { describe, expect, it, vi } from 'vitest'
 import { createRequire } from 'node:module'
-import { dirname, join } from 'node:path'
 import { weixinBridgeRuntimeInternals } from './weixin-bridge-runtime'
 
 vi.mock('electron', () => ({
   app: {
     isPackaged: false,
-    getPath: () => '/tmp/deepseek-gui-test-user-data'
+    getPath: () => '/tmp/deepseek-gui-test-user-data',
+    getVersion: () => '0.2.0-test'
   }
 }))
 
 const requireFromTest = createRequire(import.meta.url)
 
 describe('weixin bridge runtime', () => {
-  it('builds a GUI-managed OpenClaw config that activates the WeChat adapter channel', () => {
-    const config = weixinBridgeRuntimeInternals.buildGuiManagedOpenClawConfig({
-      port: 18790,
-      adapterPluginPath: '/tmp/deepseek-gui-weixin-adapter'
-    })
+  it('builds WeChat base_info from the bundled WeChat plugin package', () => {
+    const pkg = requireFromTest('@tencent-weixin/openclaw-weixin/package.json') as {
+      version: string
+    }
+    const baseInfo = weixinBridgeRuntimeInternals.buildBaseInfo()
 
-    expect(config).toMatchObject({
-      gateway: {
-        bind: 'loopback',
-        port: 18790,
-        auth: { mode: 'none' }
-      },
-      plugins: {
-        allow: ['admin-http-rpc', 'deepseek-gui-weixin-bridge-adapter'],
-        load: { paths: ['/tmp/deepseek-gui-weixin-adapter'] },
-        entries: {
-          'admin-http-rpc': { enabled: true },
-          'deepseek-gui-weixin-bridge-adapter': { enabled: true }
-        }
-      },
-      channels: {
-        'openclaw-weixin': {
-          enabled: true,
-          accounts: {
-            default: { enabled: true }
-          }
-        }
-      }
+    expect(baseInfo).toMatchObject({
+      channel_version: pkg.version,
+      bot_agent: 'DeepSeekGUI/0.2.0-test'
     })
   })
 
-  it('generates an adapter plugin that exposes WeChat QR login over web login RPC', () => {
-    const source = weixinBridgeRuntimeInternals.buildWeixinBridgeAdapterSource({
-      root: '/tmp/weixin-plugin',
-      channelModulePath: '/tmp/weixin-plugin/dist/src/channel.js',
-      compatModulePath: '/tmp/weixin-plugin/dist/src/compat.js'
-    })
+  it('keeps OpenClaw-compatible account id normalization for existing WeChat state files', () => {
+    const { normalizeAccountId } = weixinBridgeRuntimeInternals
 
-    expect(source).toContain('weixinPlugin')
-    expect(source).toContain('gatewayMethods')
-    expect(source).toContain('web.login.start')
-    expect(source).toContain('web.login.wait')
-    expect(source).toContain('DEEPSEEK_GUI_CLAW_IM_WEBHOOK_URL')
-    expect(source).toContain('postToDeepSeekGuiWebhook')
-    expect(source).toContain('sendMessageWeixin')
-    expect(source).toContain("opts.accountId || account.accountId || 'default'")
-    expect(source).toContain('deepseek-gui-weixin-bridge-adapter')
-    expect(source).toContain('lastError: message')
+    expect(normalizeAccountId('b0f5860fdecb@im.bot')).toBe('b0f5860fdecb-im-bot')
+    expect(normalizeAccountId('ABC@IM.WECHAT')).toBe('abc-im-wechat')
+    expect(normalizeAccountId('')).toBe('default')
+    expect(normalizeAccountId('__proto__')).toBe('default')
   })
 
-  it('generates adapter source that imports against the bundled WeChat plugin modules', async () => {
-    const root = dirname(requireFromTest.resolve('@tencent-weixin/openclaw-weixin/package.json'))
-    const source = weixinBridgeRuntimeInternals.buildWeixinBridgeAdapterSource({
-      root,
-      channelModulePath: join(root, 'dist', 'src', 'channel.js'),
-      compatModulePath: join(root, 'dist', 'src', 'compat.js')
-    })
-
-    const imported = await import(`data:text/javascript;base64,${Buffer.from(source).toString('base64')}`)
-
-    expect(imported.default).toMatchObject({
-      id: 'deepseek-gui-weixin-bridge-adapter'
-    })
-    expect(typeof imported.default.register).toBe('function')
-  })
-
-  it('accepts only Node versions supported by the bundled WeChat bridge runtime', () => {
-    const { parseNodeVersion, isSupportedNodeVersion } = weixinBridgeRuntimeInternals
-
-    expect(isSupportedNodeVersion(parseNodeVersion('20.19.1'))).toBe(false)
-    expect(isSupportedNodeVersion(parseNodeVersion('22.18.0'))).toBe(false)
-    expect(isSupportedNodeVersion(parseNodeVersion('22.19.0'))).toBe(true)
-    expect(isSupportedNodeVersion(parseNodeVersion('24.14.0'))).toBe(true)
+  it('does not expose the removed OpenClaw adapter builders', () => {
+    expect(Object.keys(weixinBridgeRuntimeInternals)).not.toContain('buildGuiManagedOpenClawConfig')
+    expect(Object.keys(weixinBridgeRuntimeInternals)).not.toContain('buildWeixinBridgeAdapterSource')
+    expect(Object.keys(weixinBridgeRuntimeInternals)).not.toContain('parseNodeVersion')
   })
 })

@@ -22,6 +22,7 @@ describe('Kun single-agent regression', () => {
       agentProvider: 'codewhale',
       agents: {
         codewhale: {
+          binaryPath: '/usr/local/bin/codewhale',
           port: 8787,
           apiKey: 'legacy-key',
           baseUrl: DEFAULT_DEEPSEEK_BASE_URL,
@@ -35,14 +36,45 @@ describe('Kun single-agent regression', () => {
       kun: expect.objectContaining({
         apiKey: '',
         baseUrl: '',
+        binaryPath: '',
         port: 8788,
         autoStart: false
       })
     })
-    expect(migrated.provider).toEqual({
+    expect(migrated.provider).toEqual(expect.objectContaining({
       apiKey: 'legacy-key',
       baseUrl: DEFAULT_DEEPSEEK_BASE_URL
-    })
+    }))
+  })
+
+  it('does not carry legacy local-runtime binary paths into Kun', () => {
+    const migrated = migrateLegacyAppSettings({
+      version: 1,
+      agentProvider: 'deepseek-runtime',
+      deepseek: {
+        binaryPath: '/Applications/DeepSeek Runtime.app/Contents/MacOS/deepseek-runtime',
+        port: 8787
+      }
+    } as unknown as Parameters<typeof migrateLegacyAppSettings>[0])
+
+    expect(migrated.agents?.kun).toEqual(expect.objectContaining({
+      binaryPath: '',
+      port: 8787
+    }))
+  })
+
+  it('does not keep the legacy default local HTTP port for Kun', () => {
+    const migrated = migrateLegacyAppSettings({
+      version: 1,
+      agentProvider: 'codewhale',
+      agents: {
+        codewhale: {
+          port: 7878
+        }
+      }
+    } as unknown as Parameters<typeof migrateLegacyAppSettings>[0])
+
+    expect(migrated.agents?.kun?.port).toBe(8899)
   })
 
   it('seeds provider credentials and Kun model from legacy reasoning settings', () => {
@@ -65,10 +97,10 @@ describe('Kun single-agent regression', () => {
       model: 'deepseek-reasoner',
       autoStart: false
     }))
-    expect(migrated.provider).toEqual({
+    expect(migrated.provider).toEqual(expect.objectContaining({
       apiKey: 'reasoning-key',
       baseUrl: 'https://api.deepseek.com'
-    })
+    }))
   })
 
   it('Kun adapter reports base url and id', () => {

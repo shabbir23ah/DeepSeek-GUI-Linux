@@ -58,6 +58,7 @@ import {
   stopWeixinBridgeRuntime
 } from './weixin-bridge-runtime'
 import { webhookUrl } from './claw-runtime-helpers'
+import { isKunHealthResponseBody } from './kun-health'
 
 const __dirname = dirname(fileURLToPath(import.meta.url))
 const APP_USER_MODEL_ID = 'com.xingyuzhong.deepseekgui'
@@ -345,7 +346,7 @@ async function waitForKunHealth(settings: AppSettingsV1, timeoutMs: number): Pro
         headers: runtimeAuthHeaders(settings),
         signal: AbortSignal.timeout(Math.max(250, Math.min(1_000, remaining)))
       })
-      if (res.ok) return true
+      if (res.ok && isKunHealthResponseBody(await res.text())) return true
     } catch {
       /* retry until the deadline */
     }

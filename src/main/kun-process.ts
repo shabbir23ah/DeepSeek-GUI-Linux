@@ -16,6 +16,21 @@ import {
   resolveKunExecutable
 } from './resolve-kun-binary'
 import {
+  KunConfigSchema,
+  KunServeConfigSchema,
+  ModelConfigSchema,
+  ContextCompactionConfigSchema,
+  RuntimeTuningConfigSchema
+} from '../../kun/src/config/kun-config.js'
+import {
+  AttachmentsCapabilityConfig,
+  McpCapabilityConfig,
+  MemoryCapabilityConfig,
+  SkillsCapabilityConfig,
+  SubagentsCapabilityConfig,
+  WebCapabilityConfig
+} from '../../kun/src/contracts/capabilities.js'
+import {
   buildClawScheduleMcpArgs,
   GUI_SCHEDULE_MCP_SERVER_NAME,
   type ClawScheduleMcpLaunchConfig
@@ -267,7 +282,7 @@ export async function syncGuiManagedKunConfig(
   }
 ): Promise<void> {
   const configPath = join(dataDir, 'config.json')
-  const existing = await readJsonObjectIfExists(configPath)
+  const existing = sanitizeKunConfigSections(await readJsonObjectIfExists(configPath))
 
   const serve = objectValue(existing?.serve)
   const existingTokenEconomy = objectValue(serve.tokenEconomy)
@@ -282,7 +297,6 @@ export async function syncGuiManagedKunConfig(
   const storage = storageConfigForRuntime(runtime.storage)
   const mcpSearch = runtime.mcpSearch
   const next = {
-    ...(existing ?? {}),
     serve: {
       ...serve,
       storage,
@@ -324,6 +338,12 @@ export async function syncGuiManagedKunConfig(
         }
       }
     }
+  }
+  const parsedNext = KunConfigSchema.safeParse(next)
+  if (!parsedNext.success) {
+    throw new Error(
+      `Refusing to write invalid GUI-managed Kun config at ${configPath}: ${JSON.stringify(parsedNext.error.issues, null, 2)}`
+    )
   }
   const nextText = `${JSON.stringify(next, null, 2)}\n`
   if (existing && nextText === `${JSON.stringify(existing, null, 2)}\n`) return
@@ -452,7 +472,54 @@ async function readJsonObjectIfExists(path: string): Promise<Record<string, unkn
     return objectValue(parsed)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null
+    if (error instanceof SyntaxError) return null
     throw error
+  }
+}
+
+type SafeParseSchema = {
+  safeParse: (value: unknown) =>
+    | { success: true; data: unknown }
+    | { success: false }
+}
+
+function parseKunConfigSection(
+  schema: SafeParseSchema,
+  value: unknown
+): Record<string, unknown> {
+  const parsed = schema.safeParse(objectValue(value))
+  return parsed.success ? objectValue(parsed.data) : {}
+}
+
+function sanitizeKunCapabilitiesConfig(value: unknown): Record<string, unknown> {
+  const raw = objectValue(value)
+  const next: Record<string, unknown> = {}
+  if ('mcp' in raw) next.mcp = parseKunConfigSection(McpCapabilityConfig, raw.mcp)
+  if ('web' in raw) next.web = parseKunConfigSection(WebCapabilityConfig, raw.web)
+  if ('skills' in raw) next.skills = parseKunConfigSection(SkillsCapabilityConfig, raw.skills)
+  if ('subagents' in raw) {
+    next.subagents = parseKunConfigSection(SubagentsCapabilityConfig, raw.subagents)
+  }
+  if ('attachments' in raw) {
+    next.attachments = parseKunConfigSection(AttachmentsCapabilityConfig, raw.attachments)
+  }
+  if ('memory' in raw) next.memory = parseKunConfigSection(MemoryCapabilityConfig, raw.memory)
+  return next
+}
+
+function sanitizeKunConfigSections(
+  existing: Record<string, unknown> | null
+): Record<string, unknown> | null {
+  if (!existing) return null
+  return {
+    serve: parseKunConfigSection(KunServeConfigSchema, existing.serve),
+    models: parseKunConfigSection(ModelConfigSchema, existing.models),
+    contextCompaction: parseKunConfigSection(
+      ContextCompactionConfigSchema,
+      existing.contextCompaction
+    ),
+    runtime: parseKunConfigSection(RuntimeTuningConfigSchema, existing.runtime),
+    capabilities: sanitizeKunCapabilitiesConfig(existing.capabilities)
   }
 }
 

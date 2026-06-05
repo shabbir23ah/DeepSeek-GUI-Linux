@@ -8,6 +8,7 @@ import {
   type ModelProviderSettingsPatchV1,
   type ModelProviderSettingsV1
 } from './app-settings-types'
+import { getKunRuntimeSettings } from './app-settings-kun'
 import { normalizeDeepseekBaseUrl } from './app-settings-normalizers'
 import { DEFAULT_COMPOSER_MODEL_IDS } from './default-composer-models'
 
@@ -108,7 +109,7 @@ export function listModelProviderModelIds(settings: AppSettingsV1): string[] {
 }
 
 export function resolveKunRuntimeSettings(settings: AppSettingsV1): KunRuntimeSettingsV1 {
-  const runtime = settings.agents.kun
+  const runtime = getKunRuntimeSettings(settings)
   const provider = getModelProviderProfile(settings, runtime.providerId)
   const runtimeApiKey = runtime.apiKey?.trim() ?? ''
   const runtimeBaseUrl = runtime.baseUrl?.trim() ?? ''

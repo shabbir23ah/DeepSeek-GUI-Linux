@@ -8,7 +8,13 @@ import {
   type ScheduleSettingsPatchV1,
   type WriteSettingsPatchV1
 } from './app-settings-types'
-import { defaultKunRuntimeSettings, getKunRuntimeSettings, kunSettingsEnvelope, mergeKunRuntimeSettings } from './app-settings-kun'
+import {
+  defaultKunRuntimeSettings,
+  getKunRuntimeSettings,
+  kunSettingsEnvelope,
+  mergeKunRuntimeSettings,
+  migrateLegacyAppSettings
+} from './app-settings-kun'
 import { normalizeModelProviderSettings } from './app-settings-provider'
 import { normalizeDeepseekBaseUrl } from './app-settings-normalizers'
 import { normalizeClawSettings } from './app-settings-claw'
@@ -16,7 +22,10 @@ import { normalizeScheduleSettings } from './app-settings-schedule'
 import { normalizeWriteSettings } from './app-settings-write'
 
 export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
-  const maybeSettings = settings as AppSettingsV1 & {
+  const migrated = shouldMigrateLegacySettings(settings)
+    ? migrateLegacyAppSettings(settings as Parameters<typeof migrateLegacyAppSettings>[0])
+    : settings
+  const maybeSettings = migrated as AppSettingsV1 & {
     notifications?: Partial<NotificationConfigV1>
     provider?: Parameters<typeof normalizeModelProviderSettings>[0]
     write?: WriteSettingsPatchV1
@@ -24,14 +33,31 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
     schedule?: ScheduleSettingsPatchV1
     guiUpdate?: Partial<GuiUpdateConfigV1>
   }
-  const runtime = getKunRuntimeSettings(settings)
+  const runtime = getKunRuntimeSettings(maybeSettings)
   return {
-    ...settings,
+    ...migrated,
+    version: 1,
+    locale: maybeSettings.locale === 'zh' ? 'zh' : 'en',
+    theme:
+      maybeSettings.theme === 'light' || maybeSettings.theme === 'dark' || maybeSettings.theme === 'system'
+        ? maybeSettings.theme
+        : 'system',
+    uiFontScale:
+      maybeSettings.uiFontScale === 'small' ||
+      maybeSettings.uiFontScale === 'medium' ||
+      maybeSettings.uiFontScale === 'large'
+        ? maybeSettings.uiFontScale
+        : 'small',
     provider: normalizeModelProviderSettings(maybeSettings.provider),
     agents: kunSettingsEnvelope(mergeKunRuntimeSettings(defaultKunRuntimeSettings(), {
       ...runtime,
       baseUrl: runtime.baseUrl.trim() ? normalizeDeepseekBaseUrl(runtime.baseUrl) : ''
     })),
+    workspaceRoot: typeof maybeSettings.workspaceRoot === 'string' ? maybeSettings.workspaceRoot : '',
+    log: {
+      enabled: maybeSettings.log?.enabled !== false,
+      retentionDays: typeof maybeSettings.log?.retentionDays === 'number' ? maybeSettings.log.retentionDays : 2
+    },
     notifications: {
       turnComplete: maybeSettings.notifications?.turnComplete !== false
     },
@@ -44,4 +70,23 @@ export function normalizeAppSettings(settings: AppSettingsV1): AppSettingsV1 {
       )
     }
   }
+}
+
+function shouldMigrateLegacySettings(settings: AppSettingsV1): boolean {
+  const raw = settings as AppSettingsV1 & {
+    agentProvider?: unknown
+    deepseek?: unknown
+    agents?: {
+      kun?: Partial<ReturnType<typeof defaultKunRuntimeSettings>>
+      codewhale?: unknown
+      reasonix?: unknown
+    }
+  }
+  if (!raw.agents?.kun) return true
+  if ('agentProvider' in raw || 'deepseek' in raw) return true
+  if (raw.agents.codewhale || raw.agents.reasonix) return true
+  const dataDir = typeof raw.agents.kun.dataDir === 'string'
+    ? raw.agents.kun.dataDir.replace(/\\/g, '/').toLowerCase()
+    : ''
+  return dataDir === '~/.deepseekgui/coreagent' || dataDir.endsWith('/.deepseekgui/coreagent')
 }

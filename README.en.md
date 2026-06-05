@@ -77,19 +77,17 @@ user's context budget should go toward requirements, code, decisions,
 and results, not repeated tool schemas, runaway tool output, invalid
 history, or prefixes that could have been reused from cache.
 
-Kun fuses two designs that have been battle-tested in the
+Kun fuses a design that has been battle-tested in the
 wild:
 
-- **The local-HTTP-serve boundary borrowed from [CodeWhale](https://github.com/Hmbown/CodeWhale)**: `/v1/threads`, `/v1/threads/{id}/turns`, `/v1/threads/{id}/events` (SSE), `/v1/approvals/{id}`, `/v1/usage`, `/v1/workspace/status`, `/v1/runtime/info`, `/health`. This shape keeps the GUI and the runtime completely decoupled: runtime upgrades, debugging, and replacement never require GUI changes.
 - **The cache-first agent loop borrowed from Reasonix**: immutable prompt prefix (with sha256 fingerprint), append-only session log, bounded TTL/LRU cache, inflight tracking with guaranteed cleanup, mid-turn steering queue, context compaction that preserves pinned constraints, and cache/usage telemetry.
 - **Token economy and tool-context optimization**: Kun stabilizes system prompts and tool schemas, reads DeepSeek-native cache hit/miss fields, bounds long tool results, long arguments, base64 payloads, and repeated tool loops, and can use `mcp_search` / `mcp_describe` / `mcp_call` to discover MCP tools progressively when a tool catalog is too large to advertise all at once.
 
-> Thanks to the [Hmbown/CodeWhale](https://github.com/Hmbown/CodeWhale)
-> team and the Reasonix team for sharing the runnable references
-> that made these two design pillars testable in the first place.
-> Nearly every performance trait of Kun — cache hit rate,
-> token replay, reconnect, interruptable approvals — can be
-> traced back to those two projects. The full design rationale
+> Thanks to the Reasonix team for sharing the runnable references
+> that made this design pillar testable in the first place. Nearly
+> every performance trait of Kun — cache hit rate, token replay,
+> reconnect, and interruptable approvals — can be traced back to
+> this project. The full design rationale
 > and the borrow map live in
 > [`docs/kun-architecture.md`](docs/kun-architecture.md).
 
@@ -275,9 +273,8 @@ Keyboard shortcuts:
 
 ## Write Mode Design Notes
 
-Write mode extends DeepSeek GUI from a code/chat workbench into a long-form writing workspace. Its implementation borrows several ideas from the local `textide` and `openhanako` reference projects:
+Write mode extends DeepSeek GUI from a code/chat workbench into a long-form writing workspace. Its implementation borrows several ideas from the local `openhanako` reference project:
 
-- Workspaces and file tree: textide inspired the writing-space model, keeping writing files, active file state, save status, and AI context separate from code sessions.
 - Markdown live editing: openhanako inspired the CodeMirror decorations approach where the active line stays editable as Markdown source while inactive lines render headings, tasks, images, dividers, and tables through widgets.
 - Selection inline agent: openhanako inspired the selection-capture and floating-input interaction, so selected text can be sent with file path, line numbers, and bounded original text as structured context.
 - AI session isolation: Write uses Kun threads, but the GUI keeps a local write thread registry per writing space so write conversations do not pollute Code / Connect phone sidebars.
@@ -350,9 +347,10 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md) and [DEVELOPMENT.md](./docs/DEVELO
 ```bash
 npm run build           # production build
 npm run dist:mac        # macOS packages
-npm run dist:win        # Windows installer
+npm run dist:win        # Windows installer (run on Windows)
 npm run dist:linux      # Linux AppImage
-npm run release:all     # build macOS/Windows/Linux and create a GitHub release on macOS
+npm run release:mac     # build and upload macOS release assets on macOS
+npm run release:win     # build and upload Windows release assets on Windows
 ```
 
 For the full development workflow, see [DEVELOPMENT.md](./docs/DEVELOPMENT.md).
@@ -374,15 +372,14 @@ For the full development workflow, see [DEVELOPMENT.md](./docs/DEVELOPMENT.md).
 
 ## Thanks
 
-Kun stands on the shoulders of two prior projects:
+Kun stands on the shoulders of prior projects:
 
-- **[CodeWhale](https://github.com/Hmbown/CodeWhale)** — the local HTTP serve boundary. The `/v1/threads`, `/v1/threads/{id}/turns`, `/v1/threads/{id}/events` (SSE), `/v1/approvals/{id}`, `/v1/usage`, `/v1/workspace/status`, `/v1/runtime/info`, `/health` URL shape comes directly from CodeWhale's `serve --http`. Keeping the GUI ↔ runtime boundary as a single standardized, cross-language, cross-process interface lets us reason about agent behavior the same way we reason about a network protocol.
 - **Reasonix** — the cache-first agent loop. `ImmutablePrefix` (with sha256 fingerprint) and its explicit mutation API, `AppendOnlySessionLog` (in-memory window + JSONL on disk), `LruCache` / `TtlLruCache`, `InflightTracker` with `finally`-block cleanup, `SteeringQueue` for mid-turn user guidance, `ContextCompactor` that preserves pinned constraints, and `UsageCounter` + `CacheTelemetry` are direct TypeScript ports and refinements of Reasonix's design prototypes. Reasonix's split between reasoning events and assistant text, the `tool_call` / `tool_result` pairing via `callId`, and the usage replay pattern also flow directly into the Kun event contract.
 
 We are also grateful to:
 
 - **[LobsterAI](https://github.com/netease-youdao/LobsterAI)**: its IM management, QR binding, agent binding, and customizable agent-profile flows inspired the Connect phone integration in this project.
-- **OpenHanako and textide**: their Markdown live editing, writing-space, and selection inline-agent patterns heavily informed Write mode.
+- **OpenHanako**: its Markdown live editing, writing-space, and selection inline-agent patterns heavily informed Write mode.
 - **[DeepSeek](https://github.com/deepseek-ai)**: for the models and API.
 - Everyone who contributes issues, ideas, code, and documentation to DeepSeek GUI.
 

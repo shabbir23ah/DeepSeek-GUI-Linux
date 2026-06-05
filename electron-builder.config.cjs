@@ -72,11 +72,8 @@ module.exports = {
   asar: true,
   asarUnpack: [
     '**/kun/dist/**/*',
-    '**/node_modules/node-bin-darwin-*/*',
-    '**/node_modules/node-bin-linux-*/*',
-    '**/node_modules/node-bin-win-*/*',
-    '**/node_modules/openclaw/**/*',
-    '**/node_modules/@tencent-weixin/openclaw-weixin/**/*',
+    '**/kun/package*.json',
+    '**/kun/node_modules/**/*',
     '**/node_modules/better-sqlite3/**/*',
     '**/node_modules/bindings/**/*',
     '**/node_modules/file-uri-to-path/**/*'
@@ -85,7 +82,21 @@ module.exports = {
   directories: {
     output: process.env.DEEPSEEK_GUI_DIST_DIR || 'dist'
   },
-  files: ['out/**/*', 'package.json', 'kun/dist/**/*'],
+  files: [
+    'out/**/*',
+    'package.json',
+    'kun/dist/**/*',
+    'kun/package.json',
+    'kun/package-lock.json',
+    'kun/node_modules/**/*',
+    '!**/*.map',
+    '!**/*.d.ts',
+    '!**/*.ts',
+    '!**/tsconfig*.json',
+    '!**/README*',
+    '!**/CHANGELOG*',
+    '!**/node_modules/openclaw/**/*'
+  ],
   artifactName: `DeepSeek-GUI-${artifactVersion}-\${os}-\${arch}.\${ext}`,
   publish: [
     {
