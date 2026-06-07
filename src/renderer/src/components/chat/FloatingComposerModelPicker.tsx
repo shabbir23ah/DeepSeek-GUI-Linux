@@ -221,7 +221,10 @@ export function FloatingComposerModelPicker({
                   key={option.id}
                   selected={currentReasoning === option.id}
                   title={t(option.labelKey)}
-                  onClick={() => onComposerReasoningEffortChange?.(option.id)}
+                  onClick={() => {
+                    onComposerReasoningEffortChange?.(option.id)
+                    setMenuOpen(false)
+                  }}
                 />
               ))}
             </div>
