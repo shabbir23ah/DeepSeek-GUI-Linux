@@ -32,7 +32,7 @@ const PLATFORM_SPECS = {
   },
   linux: {
     updateFile: 'latest-linux.yml',
-    assetPattern: /^DeepSeek-GUI-.+-linux-x86_64\.AppImage(\.blockmap)?$/
+    assetPattern: /^DeepSeek-GUI-.+-linux-(?:x64|x86_64|amd64)\.(?:AppImage(?:\.blockmap)?|deb|tar\.gz)$/
   }
 }
 
@@ -299,9 +299,11 @@ async function hashFile(path, algorithm, encoding) {
 function contentType(fileName) {
   if (fileName.endsWith('.yml') || fileName.endsWith('.yaml')) return 'text/yaml; charset=utf-8'
   if (fileName.endsWith('.json')) return 'application/json; charset=utf-8'
+  if (fileName.endsWith('.tar.gz')) return 'application/gzip'
   if (fileName.endsWith('.zip')) return 'application/zip'
   if (fileName.endsWith('.dmg')) return 'application/x-apple-diskimage'
   if (fileName.endsWith('.exe')) return 'application/vnd.microsoft.portable-executable'
+  if (fileName.endsWith('.deb')) return 'application/vnd.debian.binary-package'
   return 'application/octet-stream'
 }
 
@@ -309,36 +311,57 @@ function cacheControlFor(key) {
   if (/\/latest\/latest(?:-[\w]+)?\.(?:json|yml)$/.test(key)) {
     return 'public, max-age=60, must-revalidate'
   }
-  if (/\/latest\/.+\.(?:dmg|zip|exe|AppImage|blockmap)$/.test(key)) {
+  if (/\/latest\/.+\.(?:dmg|zip|exe|deb|AppImage|blockmap|tar\.gz)$/.test(key)) {
     return 'public, max-age=31536000, immutable'
   }
   return 'public, max-age=31536000, immutable'
 }
 
+function artifactFormat(fileName) {
+  if (fileName.endsWith('.AppImage')) return 'AppImage'
+  if (fileName.endsWith('.tar.gz')) return 'tar.gz'
+  if (fileName.endsWith('.dmg')) return 'dmg'
+  if (fileName.endsWith('.zip')) return 'zip'
+  if (fileName.endsWith('.exe')) return 'exe'
+  if (fileName.endsWith('.deb')) return 'deb'
+  return 'bin'
+}
+
+function isDownloadArtifact(fileName, platform) {
+  const format = artifactFormat(fileName)
+  if (platform === 'mac') return format === 'dmg' || format === 'zip'
+  if (platform === 'win') return format === 'exe'
+  if (platform === 'linux') return format === 'AppImage' || format === 'deb' || format === 'tar.gz'
+  return false
+}
+
 function classifyDownload(fileName, platform) {
-  const extension = fileName.endsWith('.AppImage')
-    ? 'AppImage'
-    : fileName.endsWith('.dmg')
-      ? 'dmg'
-      : fileName.endsWith('.zip')
-        ? 'zip'
-        : fileName.endsWith('.exe')
-          ? 'exe'
-          : 'bin'
+  const format = artifactFormat(fileName)
 
   if (platform === 'mac') {
     const arch = fileName.includes('-arm64.') ? 'arm64' : 'x64'
     return {
       platform,
       arch,
-      format: extension,
-      label: arch === 'arm64' ? `macOS Apple Silicon ${extension.toUpperCase()}` : `macOS Intel ${extension.toUpperCase()}`
+      format,
+      label: arch === 'arm64' ? `macOS Apple Silicon ${format.toUpperCase()}` : `macOS Intel ${format.toUpperCase()}`
     }
   }
   if (platform === 'win') {
-    return { platform, arch: 'x64', format: extension, label: 'Windows x64 installer' }
+    return { platform, arch: 'x64', format, label: 'Windows x64 installer' }
   }
-  return { platform, arch: 'x64', format: extension, label: 'Linux x64 AppImage' }
+
+  const linuxLabels = {
+    AppImage: 'Linux x64 AppImage',
+    deb: 'Linux x64 DEB package',
+    'tar.gz': 'Linux x64 portable tar.gz'
+  }
+  return {
+    platform,
+    arch: 'x64',
+    format,
+    label: linuxLabels[format] || 'Linux x64 package'
+  }
 }
 
 async function collectPlatformRelease({ distDir, platform, tag, channel, config }) {
@@ -390,17 +413,25 @@ async function collectPlatformRelease({ distDir, platform, tag, channel, config 
   }
 
   const filesByName = new Map(files.map((file) => [file.fileName, file]))
-  const downloads = updateMetadata.files.map((file) => {
-    const fileName = basename(file.url)
+  const downloadFileNames = Array.from(
+    new Set(
+      [...assets, ...referenced]
+        .filter((fileName) => isDownloadArtifact(fileName, platform))
+        .sort()
+    )
+  )
+
+  const downloads = downloadFileNames.map((fileName) => {
     const local = filesByName.get(fileName)
     if (!local) throw new Error(`Missing collected file: ${fileName}`)
+    const updateFile = updateMetadata.files.find((file) => basename(file.url) === fileName)
     return {
       ...classifyDownload(fileName, platform),
       fileName,
       size: local.size,
       sha256: local.sha256,
-      sha512: file.sha512 || local.sha512,
-      blockMapSize: file.blockMapSize,
+      sha512: updateFile?.sha512 || local.sha512,
+      blockMapSize: updateFile?.blockMapSize,
       archiveUrl: joinUrl(config.publicBaseUrl, config.prefix, 'channels', channel, 'releases', tag, fileName),
       latestUrl: joinUrl(config.publicBaseUrl, config.prefix, 'channels', channel, 'latest', fileName)
     }

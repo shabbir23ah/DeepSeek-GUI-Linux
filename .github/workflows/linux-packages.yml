@@ -1,0 +1,82 @@
+name: Linux Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag, for example v0.2.3'
+        required: true
+        default: 'v0.2.3'
+      channel:
+        description: 'Update channel'
+        required: true
+        default: 'frontier'
+        type: choice
+        options:
+          - frontier
+          - stable
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    name: Build Linux packages
+    runs-on: ubuntu-22.04
+    env:
+      DEEPSEEK_GUI_UPDATE_CHANNEL: ${{ github.event.inputs.channel || 'frontier' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Resolve release version
+        id: release
+        shell: bash
+        run: |
+          TAG="${{ github.event.inputs.tag || github.ref_name }}"
+          VERSION="${TAG#v}"
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release tag: $TAG" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Linux artifacts
+        env:
+          DEEPSEEK_GUI_APP_VERSION: ${{ steps.release.outputs.version }}
+        run: npm run dist:linux
+
+      - name: List artifacts
+        run: find dist -maxdepth 1 -type f -print | sort
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-gui-linux-${{ steps.release.outputs.version }}
+          path: |
+            dist/DeepSeek-GUI-${{ steps.release.outputs.version }}-linux-*
+            dist/latest-linux.yml
+          if-no-files-found: error
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: DeepSeek GUI ${{ steps.release.outputs.tag }}
+          body_path: release/release-${{ steps.release.outputs.tag }}.md
+          files: |
+            dist/DeepSeek-GUI-${{ steps.release.outputs.version }}-linux-*
+            dist/latest-linux.yml

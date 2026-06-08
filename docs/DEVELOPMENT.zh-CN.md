@@ -76,6 +76,19 @@ npm run dev
 
 并手动验证受影响流程后再发起 PR。
 
+## Linux 打包说明
+
+Linux 发布建议先产出 Debian 包，再按需生成便携分发产物：
+
+```bash
+npm run dist:linux:deb       # Linux 第一优先产物
+npm run dist:linux:appimage  # 保留现有跨发行版安装方式
+npm run dist:linux:tar.gz    # 便携解压即用包
+npm run dist:linux           # 一次生成全部 Linux 产物
+```
+
+如果改动影响发布分发链路，发起 PR 前还应针对生成好的 `dist/` 目录执行一次 R2 发布脚本 dry-run。
+
 ## PR 质量标准
 
 代码不难，难得的是好品味。评审要守住产品体验，而不只是实现是否能跑。

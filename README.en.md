@@ -75,7 +75,7 @@ The result: Kun is built for real project work with long tasks, long sessions, a
 - Connect phone automation with Feishu / Lark / WeChat integration, dedicated IM agents, local webhook / relay support, and scheduled tasks.
 - A dedicated Write workbench with writing spaces, a Markdown file tree, live editing/preview, inline completion, and selection-based inline agent actions.
 - New requirement drafts, plans, thread todos, long-running goals, and code review so tasks can move from idea to execution to review.
-- Pre-built macOS, Windows, and Linux installers; source builds remain available.
+- Pre-built macOS, Windows, and Linux packages; source builds remain available.
 
 ## Highlights
 
@@ -98,7 +98,7 @@ The result: Kun is built for real project work with long tasks, long sessions, a
 - **Friendly first launch**: choose language, add your DeepSeek API key, and optionally set a compatible Base URL.
 - **Local-first**: preferences, sessions, logs, and runtime config stay on your machine; model calls use your own DeepSeek API key.
 - **English and Chinese UI**: switch languages from Settings at any time.
-- **Cross-platform use**: macOS `.dmg/.zip`, Windows `.exe`, and Linux `.AppImage`; source builds remain available.
+- **Cross-platform use**: macOS `.dmg/.zip`, Windows `.exe`, and Linux `.deb` / `.AppImage` / portable `.tar.gz`; source builds remain available.
 
 ## Runtime: Kun
 
@@ -243,7 +243,7 @@ Download the latest build from [GitHub Releases](https://github.com/XingYu-Zhong
 | --- | --- |
 | macOS | `.dmg` or `.zip`, Intel and Apple Silicon |
 | Windows | `.exe`, NSIS installer, x64 |
-| Linux | `.AppImage`, x64 |
+| Linux | `.deb` (preferred on Debian / Ubuntu), `.AppImage`, or portable `.tar.gz`, x64 |
 
 On first launch, enter your [DeepSeek API key](https://platform.deepseek.com/api_keys). If you use a DeepSeek/OpenAI-compatible endpoint, you can set a custom Base URL in Settings.
 
@@ -347,7 +347,8 @@ npm run mac:unquarantine -- '/Applications/DeepSeek GUI.app'
 
 ### Linux
 
-- If you built a Linux package from source, delete the related `.AppImage` or installed files.
+- For Debian-based installs, remove the package with `sudo apt remove deepseek-gui` or `sudo dpkg -r deepseek-gui`.
+- For `.AppImage` or portable `.tar.gz` builds, delete the downloaded file or extracted directory.
 - If you manually created a desktop entry or shortcut, delete that too.
 
 ### Remove Local Data
@@ -391,7 +392,10 @@ See [CONTRIBUTING.md](./docs/CONTRIBUTING.md) and [DEVELOPMENT.md](./docs/DEVELO
 npm run build           # production build
 npm run dist:mac        # macOS packages
 npm run dist:win        # Windows installer (run on Windows)
-npm run dist:linux      # Linux AppImage
+npm run dist:linux      # Linux DEB + AppImage + portable tar.gz
+npm run dist:linux:deb  # Linux DEB (preferred first step)
+npm run dist:linux:appimage
+npm run dist:linux:tar.gz
 npm run release:mac     # build and upload macOS release assets on macOS
 npm run release:win     # build and upload Windows release assets on Windows
 ```

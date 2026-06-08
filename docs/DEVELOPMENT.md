@@ -76,6 +76,19 @@ npm run dev
 
 Manually verify the affected workflow before opening the PR.
 
+## Linux Packaging Notes
+
+For Linux release work, prefer the Debian package first and then generate the portable artifacts as needed:
+
+```bash
+npm run dist:linux:deb       # preferred first Linux artifact
+npm run dist:linux:appimage  # keep the existing cross-distro installer
+npm run dist:linux:tar.gz    # portable unpack-and-run archive
+npm run dist:linux           # build all Linux artifacts together
+```
+
+If a packaging change affects release distribution, also dry-run the R2 publish flow against the generated `dist/` directory before opening the PR.
+
 ## PR Quality Standard
 
 Code is easy. Good taste is rare. Review should protect the product experience, not only the implementation.

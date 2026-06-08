@@ -1,6 +1,8 @@
 const { existsSync, readFileSync } = require('node:fs')
 const { join } = require('node:path')
 
+const packageManifest = JSON.parse(readFileSync(join(__dirname, 'package.json'), 'utf8'))
+
 function loadLocalReleaseEnv() {
   const candidates = [
     process.env.DEEPSEEK_GUI_RELEASE_ENV,
@@ -53,6 +55,18 @@ const updateChannel = normalizeUpdateChannel(process.env.DEEPSEEK_GUI_UPDATE_CHA
 const genericUpdateUrl = `${r2PublicBaseUrl}/${r2ReleasePrefix}/channels/${updateChannel}/latest/`
 const releaseAppVersion = (process.env.DEEPSEEK_GUI_APP_VERSION || '').trim()
 const artifactVersion = releaseAppVersion || '${version}'
+const linuxVendor = normalizePackageParty(packageManifest.author) || 'DeepSeek GUI Contributors'
+const linuxMaintainer = (process.env.DEEPSEEK_GUI_DEB_MAINTAINER || '').trim() || linuxVendor
+
+function normalizePackageParty(raw) {
+  if (typeof raw === 'string') return raw.trim()
+  if (!raw || typeof raw !== 'object') return ''
+
+  const name = typeof raw.name === 'string' ? raw.name.trim() : ''
+  const email = typeof raw.email === 'string' ? raw.email.trim() : ''
+  if (name && email) return `${name} <${email}>`
+  return name || email
+}
 
 function normalizeUpdateChannel(raw) {
   const value = String(raw || '').trim()
@@ -144,8 +158,33 @@ module.exports = {
   },
   linux: {
     category: 'Development',
+    synopsis: 'Desktop AI workbench for DeepSeek and the Kun runtime',
+    description:
+      'DeepSeek GUI packages the Kun local runtime into a desktop workbench for code, writing, and automation workflows.',
+    maintainer: linuxMaintainer,
+    vendor: linuxVendor,
     icon: './src/asset/img/deepseek.png',
-    target: [{ target: 'AppImage', arch: ['x64'] }]
+    target: [
+      { target: 'deb', arch: ['x64'] },
+      { target: 'AppImage', arch: ['x64'] },
+      { target: 'tar.gz', arch: ['x64'] }
+    ]
+  },
+  deb: {
+    packageCategory: 'utils',
+    priority: 'optional',
+    depends: [
+      'libgtk-3-0',
+      'libnotify4',
+      'libnss3',
+      'libxss1',
+      'libxtst6',
+      'xdg-utils',
+      'libatspi2.0-0',
+      'libuuid1',
+      'libsecret-1-0'
+    ],
+    recommends: ['libayatana-appindicator3-1 | libappindicator3-1']
   },
   extraMetadata: {
     ...(releaseAppVersion ? { version: releaseAppVersion } : {}),
