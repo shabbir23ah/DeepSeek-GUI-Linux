@@ -1,28 +1,75 @@
-# DeepSeek GUI v0.2.3
+# DeepSeek GUI Linux v0.2.3
 
-这一版把 Linux 分发补齐到了更适合日常发布的状态，重点是让 Debian 系发行版拿到原生安装包，同时保留已有的通用下载方式。
+This release adds Linux-focused packaging for the personal DeepSeek GUI Linux fork.
 
-### Linux 现在有 `.deb`
+> [!IMPORTANT]
+> This is a personal project. Review the source code, build scripts, and packaged artifacts before installing or running it. The app can run local runtime processes and can access local workspaces depending on the permissions selected in the GUI.
 
-- Linux 构建现在会产出 `.deb`，适合 Debian、Ubuntu、Mint 等发行版直接通过 `apt install ./xxx.deb` 安装。
-- Debian 包补上了常见 Electron 运行依赖和托盘相关推荐依赖，安装后更接近普通桌面应用体验。
-- 这次调整不会替换原有 Linux 产物，而是把 `.deb` 作为第一优先分发格式补进来。
+## Linux Packages
 
-### 继续保留 `.AppImage`
+- Added a `.deb` package for Debian-based distributions such as Debian, Ubuntu, Linux Mint, Pop!_OS, and Zorin OS.
+- Kept the existing `.AppImage` format for portable use across Linux distributions.
+- Added a portable `.tar.gz` archive for manual installs and custom distribution workflows.
+- Updated the Linux release workflow so packages are built on Ubuntu and attached to GitHub Releases.
+- Updated release publishing metadata so Linux release manifests can list `.deb`, `.AppImage`, and `.tar.gz` downloads.
 
-- 原有 `.AppImage` 仍然保留，方便继续覆盖更广的 Linux 发行版和无需安装的使用方式。
-- Linux 更新元数据仍然沿用 `latest-linux.yml`，现有 Linux 更新链路不需要切换到新的协议。
+## Install `.deb`
 
-### 新增便携 `.tar.gz`
+```bash
+sudo apt install ./DeepSeek-GUI-0.2.3-linux-amd64.deb
+```
 
-- 除了 `.deb` 和 `.AppImage`，现在还会生成便携 `.tar.gz`，适合不想安装系统包、只想解压运行的场景。
-- 这个包定位是“手动分发 / 自托管下载”产物，不依赖发行版包管理器。
+Fallback:
 
-### 发布链路同步更新
+```bash
+sudo dpkg -i DeepSeek-GUI-0.2.3-linux-amd64.deb
+sudo apt -f install
+```
 
-- R2 发布脚本现在会把 Linux `.deb`、`.AppImage` 和 `.tar.gz` 一起识别为可下载资产。
-- 生成的 Linux release manifest 不再默认只有 AppImage，而是会列出多个 Linux 下载格式，便于下载页或自定义分发页面直接消费。
+Uninstall:
 
-### 总结
+```bash
+sudo apt remove deepseek-gui
+```
 
-v0.2.3 的重点不是桌面功能，而是 Linux 发布面更完整了：Debian 系用户有原生 `.deb`，跨发行版用户继续有 `.AppImage`，同时也提供了更轻量的便携 `.tar.gz`。
+## Run `.AppImage`
+
+```bash
+chmod +x DeepSeek-GUI-0.2.3-linux-x86_64.AppImage
+./DeepSeek-GUI-0.2.3-linux-x86_64.AppImage
+```
+
+Some distributions require FUSE support for AppImage files. On Debian/Ubuntu, install it with:
+
+```bash
+sudo apt install libfuse2
+```
+
+## Build From Source Tarball
+
+```bash
+curl -L https://github.com/shabbir23ah/DeepSeek-GUI-Linux/archive/refs/tags/v0.2.3.tar.gz -o DeepSeek-GUI-Linux-v0.2.3.tar.gz
+tar -xzf DeepSeek-GUI-Linux-v0.2.3.tar.gz
+cd DeepSeek-GUI-Linux-0.2.3
+npm ci
+npm run typecheck
+npm run test
+npm run build
+npm run dist:linux
+```
+
+Build individual package formats:
+
+```bash
+npm run dist:linux:deb
+npm run dist:linux:appimage
+npm run dist:linux:tar.gz
+```
+
+Generated packages are written to `dist/`.
+
+## Notes
+
+- This fork is not affiliated with DeepSeek Inc. or the upstream DeepSeek GUI maintainers.
+- You need your own DeepSeek API key or compatible API endpoint after first launch.
+- Removing the app package does not remove local data under `~/.config/DeepSeek GUI` or Kun runtime data under `~/.deepseekgui/kun`.
